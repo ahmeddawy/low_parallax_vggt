@@ -58,6 +58,9 @@ Usage examples:
 
 import argparse
 import csv
+import io
+import contextlib
+import functools
 import json
 import os
 import os.path as osp
@@ -65,6 +68,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -557,6 +561,14 @@ def process_sequence(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _process_sequence_worker(seq_dir: str, kwargs: dict):
+    """Worker wrapper: captures per-sequence stdout so parallel output stays grouped."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = process_sequence(seq_dir, **kwargs)
+    return buf.getvalue(), result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -587,6 +599,10 @@ def main():
         help="Copy track files instead of symlinking.",
     )
     parser.add_argument(
+        "--workers", type=int, default=8,
+        help="Number of parallel worker processes. Default: 8. Use 1 for sequential.",
+    )
+    parser.add_argument(
         "--skip-masked-depth", action="store_true",
         help="Skip masked_depth generation (steps 3 & 4).",
     )
@@ -610,21 +626,44 @@ def main():
 
     print(f"Found {len(seq_dirs)} sequence(s) under {dataset_dir}\n")
 
+    kwargs = dict(
+        out_dtype=args.depth_dtype,
+        overwrite_depth=args.overwrite_depth,
+        overwrite_masked_depth=args.overwrite_masked_depth,
+        overwrite_tracks=args.overwrite_tracks,
+        use_symlink=not args.copy_tracks,
+        skip_masked_depth=args.skip_masked_depth,
+        keep_classes={c.strip().lower() for c in args.keep_classes},
+    )
+
     results: List[SequenceResult] = []
-    for seq_dir in seq_dirs:
-        print(f"[{osp.basename(seq_dir)}]")
-        res = process_sequence(
-            seq_dir,
-            out_dtype=args.depth_dtype,
-            overwrite_depth=args.overwrite_depth,
-            overwrite_masked_depth=args.overwrite_masked_depth,
-            overwrite_tracks=args.overwrite_tracks,
-            use_symlink=not args.copy_tracks,
-            skip_masked_depth=args.skip_masked_depth,
-            keep_classes={c.strip().lower() for c in args.keep_classes},
-        )
-        results.append(res)
-        print()
+
+    n_workers = max(1, args.workers)
+    if n_workers == 1:
+        for seq_dir in seq_dirs:
+            print(f"[{osp.basename(seq_dir)}]")
+            res = process_sequence(seq_dir, **kwargs)
+            results.append(res)
+            print()
+    else:
+        print(f"Running with {n_workers} parallel workers...\n")
+        worker_fn = functools.partial(_process_sequence_worker, kwargs=kwargs)
+        # Submit all, collect in completion order (fastest seqs print first)
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(worker_fn, seq_dir): seq_dir for seq_dir in seq_dirs}
+            for future in as_completed(futures):
+                seq_dir = futures[future]
+                try:
+                    output, res = future.result()
+                except Exception as exc:
+                    seq_name = osp.basename(seq_dir)
+                    print(f"[{seq_name}]\n  ERROR — unhandled exception: {exc}\n")
+                    res = SequenceResult(seq_name=seq_name, ok=False, reason=str(exc))
+                    output = ""
+                print(f"[{osp.basename(seq_dir)}]")
+                print(output, end="")
+                results.append(res)
+                print()
 
     ok_count   = sum(1 for r in results if r.ok)
     fail_count = len(results) - ok_count
