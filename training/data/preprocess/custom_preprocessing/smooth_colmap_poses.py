@@ -205,9 +205,18 @@ def process_sequence(seq_dir, camera_type, motion_threshold, savgol_window, savg
     )   # (N, 3)
 
     if resolved_type == "fixed":
-        median_t       = np.median(translations, axis=0)
-        new_translations = np.broadcast_to(median_t, translations.shape).copy()
-        print(f"  Fixed: median translation = [{median_t[0]:.4f}, {median_t[1]:.4f}, {median_t[2]:.4f}]")
+        # Heavy Savitzky-Golay smoothing: 50% window, linear trend (polyorder=1).
+        # Removes high-frequency jitter while preserving slow residual drift.
+        # Hard-locking to median was removed because it zeroes depth gradient
+        # in the reprojection loss (fixed E0=Ej → projection is depth-invariant).
+        fixed_window = max(5, int(len(translations) * 0.5))
+        new_translations = smooth_translations_savgol(
+            translations,
+            window_length=fixed_window,
+            polyorder=1,
+        )
+        mean_change = float(np.abs(new_translations - translations).mean())
+        print(f"  Fixed (heavy smooth, window={fixed_window}): mean |Δt| after smoothing = {mean_change:.4f}")
 
     elif resolved_type == "low_parallax":
         new_translations = smooth_translations_savgol(
