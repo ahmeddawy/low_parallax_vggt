@@ -669,6 +669,8 @@ class Trainer:
 
                 for key, grad_norm in grad_norm_dict.items():
                     loss_meters[f"Grad/{key}"].update(grad_norm)
+                    if self.steps[phase] % self.logging_conf.log_freq == 0 and self.rank == 0:
+                        self.tb_writer.log(f"Grad/{key}", grad_norm, self.steps[phase])
 
             # Optimizer step
             for optim in self.optims:   
