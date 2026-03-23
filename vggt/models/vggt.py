@@ -86,7 +86,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             track_list, vis, conf = self.track_head(
                 aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
             )
-            predictions["track"] = track_list[-1]  # track of the last iteration
+            predictions["track"] = track_list[-1]   # last iteration, pixel coords
+            predictions["track_list"] = track_list   # all iterations for multi-stage loss
             predictions["vis"] = vis
             predictions["conf"] = conf
 

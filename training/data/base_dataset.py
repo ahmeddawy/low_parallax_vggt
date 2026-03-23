@@ -67,6 +67,11 @@ class BaseDataset(Dataset):
         Returns:
             Dataset item as returned by get_data()
         """
+        # unpacking of idx_N — the index is not a plain integer but a tuple of 3 values that the DynamicBatchSampler prepares:
+        #     seq_index → which sequence to load
+        #     img_per_seq → how many frames to sample from it (the dynamic part)
+        #     aspect_ratio → sampled from aspects range, same for all images in the batch
+
         seq_index, img_per_seq, aspect_ratio = idx_N
         return self.get_data(
             seq_index=seq_index, img_per_seq=img_per_seq, aspect_ratio=aspect_ratio
@@ -102,13 +107,16 @@ class BaseDataset(Dataset):
         Returns:
             numpy.ndarray: Target image shape [height, width]
         """
+        # 1-Compute rescaled height = img_size × aspect_ratio (e.g., 518 × 0.5625 = 291)
         short_size = int(self.img_size * aspect_ratio)
         small_size = self.patch_size
-
+        
+        # 2-Rounds height down to nearest multiple of patch_size=14
         # ensure the input shape is friendly to vision transformer
         if short_size % small_size != 0:
             short_size = (short_size // small_size) * small_size
 
+        # 3-Returns [height, width] = e.g., [294, 518]
         image_shape = np.array([short_size, self.img_size])
         return image_shape
 
@@ -153,8 +161,12 @@ class BaseDataset(Dataset):
             )
         """
         # Make copies to avoid in-place operations affecting original data
-        image = np.copy(image)
+
+        # Copy the original image and depth map with their raw Resolution (1920x1080) for whisper dataset.
+        image = np.copy(image) 
         depth_map = np.copy(depth_map)
+        
+        # Copy the extrinsic and intrinsic matrices, and track if provided.
         extri_opencv = np.copy(extri_opencv)
         intri_opencv = np.copy(intri_opencv)
         if track is not None:
@@ -191,6 +203,7 @@ class BaseDataset(Dataset):
                     rotate_to_portrait = True
 
         # Resize images and update intrinsics
+        # This is where 1920×1080 → 518×294 happens.
         if self.rescale:
             image, depth_map, intri_opencv, track = resize_image_depth_and_intrinsic(
                 image, depth_map, intri_opencv, target_shape, original_size, track=track,

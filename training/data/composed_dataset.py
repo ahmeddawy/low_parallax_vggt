@@ -69,6 +69,9 @@ class ComposedDataset(Dataset, ABC):
         self.load_track = common_config.load_track
         # Number of point tracks to include per sequence
         self.track_num = common_config.track_num
+        # Track source control
+        self.use_gt_tracks = getattr(common_config, "use_gt_tracks", True)
+        self.use_depth_tracks = getattr(common_config, "use_depth_tracks", False)
 
         # --- Mode Settings ---
         # Whether the dataset is being used for training (affects augmentations)
@@ -146,35 +149,44 @@ class ComposedDataset(Dataset, ABC):
 
         # --- Track Processing (if enabled) ---
         if self.load_track:
-            if batch["tracks"] is not None:
-                # Use pre-computed tracks from the dataset
-                tracks = torch.from_numpy(np.stack(batch["tracks"]).astype(np.float32))
-                track_vis_mask = torch.from_numpy(np.stack(batch["track_masks"]).astype(bool))
+            has_gt = batch["tracks"] is not None and self.use_gt_tracks
 
-                # Sample a subset of tracks randomly
-                valid_indices = torch.where(track_vis_mask[0])[0]
-                if len(valid_indices) >= self.track_num:
-                    # If we have enough tracks, sample without replacement
-                    sampled_indices = valid_indices[torch.randperm(len(valid_indices))][:self.track_num]
-                else:
-                    # If not enough tracks, sample with replacement (allow duplicates)
-                    sampled_indices = valid_indices[torch.randint(0, len(valid_indices),
-                                                    (self.track_num,),
-                                                    dtype=torch.int64,
-                                                    device=valid_indices.device)]
+            # --- GT tracks (pre-computed, e.g. AE plane tracks) ---
+            if has_gt:
+                gt_tracks = torch.from_numpy(np.stack(batch["tracks"]).astype(np.float32))
+                gt_vis_mask = torch.from_numpy(np.stack(batch["track_masks"]).astype(bool))
 
-                # Extract the sampled tracks and their masks
-                tracks = tracks[:, sampled_indices, :]
-                track_vis_mask = track_vis_mask[:, sampled_indices]
-                track_positive_mask = torch.ones(track_vis_mask.shape[1]).bool()
+                # Use all available GT tracks (no repetition), capped at track_num
+                valid_idx = torch.where(gt_vis_mask[0])[0]
+                n_gt = min(len(valid_idx), self.track_num)
+                sampled = valid_idx[torch.randperm(len(valid_idx))][:n_gt]
+                gt_tracks = gt_tracks[:, sampled, :]
+                gt_vis_mask = gt_vis_mask[:, sampled]
 
+            # --- Depth-based background tracks (on-the-fly) ---
+            # Fill remaining slots up to track_num
+            if self.use_depth_tracks:
+                n_depth = self.track_num - (n_gt if has_gt else 0)
+                if n_depth > 0:
+                    depth_tracks, depth_vis_mask, _ = build_tracks_by_depth(
+                        extrinsics, intrinsics, world_points, depths, point_masks, images,
+                        target_track_num=n_depth, seq_name=seq_name,
+                    )
+
+            # --- Merge sources ---
+            if has_gt and self.use_depth_tracks and n_depth > 0:
+                tracks = torch.cat([gt_tracks, depth_tracks], dim=1)
+                track_vis_mask = torch.cat([gt_vis_mask, depth_vis_mask], dim=1)
+            elif has_gt:
+                tracks, track_vis_mask = gt_tracks, gt_vis_mask
             else:
-                # Generate tracks on-the-fly using depth information
-                # This creates synthetic tracks based on the 3D information available
-                tracks, track_vis_mask, track_positive_mask = build_tracks_by_depth(
+                # depth-only (or GT disabled / not available)
+                tracks, track_vis_mask, _ = build_tracks_by_depth(
                     extrinsics, intrinsics, world_points, depths, point_masks, images,
-                    target_track_num=self.track_num, seq_name=seq_name
+                    target_track_num=self.track_num, seq_name=seq_name,
                 )
+
+            track_positive_mask = torch.ones(track_vis_mask.shape[1]).bool()
 
             # Add track information to the sample dictionary
             sample["tracks"] = tracks

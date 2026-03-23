@@ -2,22 +2,21 @@ defaults:
   - default_dataset.yaml
 
 exp_name: exp001
-img_size: 518
+img_size: 518 # The long side of the image (the width). The height is not fixed — it's determined by the aspect ratio sampled per batch:aspects
 num_workers: 8
 seed_value: 42
 accum_steps: 2    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
-patch_size: 14
-val_epoch_freq: 5
-max_img_per_gpu: 48
+patch_size: 14    # The ViT patch size. Images must be divisible by this. All resizing logic ensures that.
+val_epoch_freq: 5  # Run validation every 5 epochs, not every epoch. Saves time.
+max_img_per_gpu: 48 # The budget for how many images fit on one GPU per step. The actual batch size is computed dynamically as floor(48 / num_frames_per_sequence). So if a sequence has 4 frames → batch_size=12, if 24 frames → batch_size=2.
 
-limit_train_batches: 800
-limit_val_batches: 400
+limit_train_batches: 800 # Cap the training loop at 800 iterations per epoch, even if the dataset has more.
+limit_val_batches: 400 #Cap the validation loop at 400 iterations per epoch, even if the dataset has more. This is especially useful if your validation set is large and you want to save time during training. You can set it to 1.0 to use the entire validation set, or to an integer to specify the exact number of batches to use.
 
 
-data:
-  # The code for data still looks too complicated. I should refactor this again (do I have time?...)
-  train:
-    _target_: data.dynamic_dataloader.DynamicTorchDataset
+data: # The data section has two parallel blocks — train and val. Each is a 3-layer stack:
+  train: # 1st block (train)
+    _target_: data.dynamic_dataloader.DynamicTorchDataset # Layer 1: DataLoader wrapper: Owns the DataLoader. Gets num_workers, max_img_per_gpu, and common_config. Handles the dynamic batch sizing.
     num_workers: ${num_workers}
     max_img_per_gpu: ${max_img_per_gpu}
     common_config:
@@ -26,14 +25,14 @@ data:
       debug: False
       repeat_batch: False
     dataset:
-      _target_: data.composed_dataset.ComposedDataset
+      _target_: data.composed_dataset.ComposedDataset # Layer 2: ComposedDataset wrapper: Sits between the DataLoader and dataset. Handles: Converting numpy → tensors, Color augmentation, Track loading (if enabled), Aspect ratio sampling, Rescaling
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        - _target_: data.datasets.co3d.Co3dDataset # Layer 3: The actual dataset
           split: train
           CO3D_DIR: /YOUR/PATH/TO/CO3D
           CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
-  val:
-    _target_: data.dynamic_dataloader.DynamicTorchDataset
+  val: # 2nd block (val)
+    _target_: data.dynamic_dataloader.DynamicTorchDataset # Layer 1: DataLoader wrapper
     num_workers: ${num_workers}
     max_img_per_gpu: ${max_img_per_gpu}
     common_config:
@@ -41,9 +40,9 @@ data:
       patch_size: ${patch_size}
       debug: False
     dataset:
-      _target_: data.composed_dataset.ComposedDataset
+      _target_: data.composed_dataset.ComposedDataset # Layer 2: ComposedDataset wrapper
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        - _target_: data.datasets.co3d.Co3dDataset # Layer 3: The actual dataset
           split: test
           CO3D_DIR: /YOUR/PATH/TO/CO3D
           CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
@@ -97,21 +96,26 @@ loss:
     loss_type: "l1" # The paper uses smooth l1 loss, but we found l1 loss is more stable than smooth l1 and l2 loss.  
   depth:
     weight: 1.0
-    gradient_loss_fn: "grad" 
+    gradient_loss_fn: "grad"
     valid_range: 0.98
+    invalid_conf_weight: 0.0    # set > 0 to penalize high conf at masked pixels (plane + dynamic objects)
+    invalid_conf_target: 1.0    # minimum conf value for expp1 activation
+    invalid_conf_loss_type: "l2"
   point: null
   # If you want to enable point, use the following config
   # point: 
   #   weight: 1.0
   #   gradient_loss_fn: "normal" 
   #   valid_range: 0.98
-  track: null   
-
-
+  track: null
+  reproj: null
+  # To enable reprojection loss (requires load_track: True and tracks.npy in dataset):
+  # reproj:
+  #   weight: 2.0
 
 
 optim:
-  param_group_modifiers: False
+  param_group_modifiers: False # If True, allows different learning rates per parameter group 
 
   optimizer:
     _target_: torch.optim.AdamW
@@ -119,7 +123,7 @@ optim:
     weight_decay: 0.05
 
   frozen_module_names:
-      - "*aggregator*"  # example, freeze the aggregator
+      - "*aggregator*"  # Freezes the entire ViT backbone. The * is a glob pattern so it matches any module name containing "aggregator".
 
   amp:
     enabled: True
@@ -171,7 +175,7 @@ distributed:
   # check https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html for options
   backend: nccl
   comms_dtype: None
-  find_unused_parameters: False
+  find_unused_parameters: False # change this when using LoRA
   timeout_mins: 30
   gradient_as_bucket_view: True  # Less memory used
   bucket_cap_mb: 25

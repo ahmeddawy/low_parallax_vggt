@@ -1,0 +1,45 @@
+1- dataset training resolution
+the key img_size:518 : this would make the width 518. For 1920x1080 the best config is to fix the aspects: [0.5625, 0.5625]  
+why not [0.5625, 1.0] ? this means randomly sampling aspect ratios between 0.5625 and 1.0 each batch — so some batches would be 518×294, others 518×518, and everything in between. That would be wrong for your dataset since your images are always 16:9.
+
+2- the batch size:
+the batch size is determinded dynamicall such that it equals to
+batch_size = floor(max_img_per_gpu / num_frames_per_sequence)
+So for example:
+    4 frames per sequence → batch_size = floor(48/4) = 12 sequences
+    8 frames → batch_size = floor(48/8) = 6 sequences
+    24 frames → batch_size = floor(48/24) = 2 sequences
+the frames per sequence comes from img_nums :
+    img_nums: [2, 24] : This means each batch randomly samples between 2 and 24 frames from a single sequence.
+    The exact number is sampled fresh for every batch by the DynamicBatchSampler.
+    So in one batch we might have 6 frames per sequence, in the next 15, in the next 3 — it varies constantly during training.
+
+3- For law parralex dataset it is better to set 
+get_nearby: False : samples frames spread across all 204 → you accumulate the motion across the full sequence → actual baseline.
+allow_duplicate_img: False
+
+4- General formula for iteration limits per epoch:
+    avg_img_per_seq comes from img_nums
+    limit_train_batches = (num_train_seq / floor(max_img_per_gpu / avg_img_per_seq))
+    limit_val_batches   = num_val_seq   / floor(max_img_per_gpu / avg_img_per_seq)
+
+5- find_unused_parameters: False # change this when using LoRA
+   why? with LoRA, frozen parameters have no gradients — DDP needs to know about unused parameters to avoid hanging.
+
+6- For low parallax dataset, suggested img_nums: [8, 24] instead of [2, 24]
+   why? more frames per sequence since each individual pair has small baseline — more views = more accumulated motion signal.
+
+7- Iteration limits define one epoch, max_epochs controls total training duration:
+   limit_train_batches = one full pass over train set (see formula in note 4)
+   max_epochs = how many full passes total (e.g., 100 for small datasets)
+
+8- scales: [0.8, 1.2] — random scale augmentation applied per image before resizing.
+   Randomly zooms in/out by up to 20%. Safe to keep as-is even with pseudo GT labels
+   because resize_image_depth_and_intrinsic updates the intrinsics accordingly — depth
+   supervision remains geometrically consistent after augmentation.
+
+9- Loss suggestions for pseudo GT labels:
+   camera:
+     weight: 3.0  (suggestion, lower than default 5.0 — pseudo GT poses are noisy)
+   depth:
+     valid_range: 0.95  (suggestion, filter more outliers than default 0.98)

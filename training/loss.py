@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from dataclasses import dataclass
-from vggt.utils.pose_enc import extri_intri_to_pose_encoding
+from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
 from train_utils.general import check_and_fix_inf_nan
 from math import ceil, floor
 
@@ -22,15 +22,16 @@ class MultitaskLoss(torch.nn.Module):
     - Camera loss
     - Depth loss 
     - Point loss
-    - Tracking loss (not cleaned yet, dirty code is at the bottom of this file)
+    - Tracking loss
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, **kwargs):
+    def __init__(self, camera=None, depth=None, point=None, track=None, reproj=None, **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
         self.depth = depth
         self.point = point
         self.track = track
+        self.reproj = reproj
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -56,7 +57,12 @@ class MultitaskLoss(torch.nn.Module):
         # Depth estimation loss - if depth maps are predicted
         if "depth" in predictions:
             depth_loss_dict = compute_depth_loss(predictions, batch, **self.depth)
-            depth_loss = depth_loss_dict["loss_conf_depth"] + depth_loss_dict["loss_reg_depth"] + depth_loss_dict["loss_grad_depth"]
+            depth_loss = (
+                depth_loss_dict["loss_conf_depth"]
+                + depth_loss_dict["loss_reg_depth"]
+                + depth_loss_dict["loss_grad_depth"]
+                + depth_loss_dict.get("loss_mask_conf_depth", 0.0)
+            )
             depth_loss = depth_loss * self.depth["weight"]
             total_loss = total_loss + depth_loss
             loss_dict.update(depth_loss_dict)
@@ -64,15 +70,46 @@ class MultitaskLoss(torch.nn.Module):
         # 3D point reconstruction loss - if world points are predicted
         if "world_points" in predictions:
             point_loss_dict = compute_point_loss(predictions, batch, **self.point)
-            point_loss = point_loss_dict["loss_conf_point"] + point_loss_dict["loss_reg_point"] + point_loss_dict["loss_grad_point"]
+            point_loss = (
+                point_loss_dict["loss_conf_point"]
+                + point_loss_dict["loss_reg_point"]
+                + point_loss_dict["loss_grad_point"]
+                + point_loss_dict.get("loss_mask_conf_point", 0.0)
+            )
             point_loss = point_loss * self.point["weight"]
             total_loss = total_loss + point_loss
             loss_dict.update(point_loss_dict)
 
-        # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
-        if "track" in predictions:
-            raise NotImplementedError("Track loss is not cleaned up yet")
+        # Tracking loss
+        if "track_list" in predictions and self.track is not None and "tracks" in batch:
+            track_loss, vis_loss, conf_loss = compute_track_loss(
+                predictions["track_list"],
+                predictions["vis"],
+                predictions.get("conf", None),
+                batch,
+                **self.track,
+            )
+            if track_loss is not None:
+                total_track_loss = (
+                    track_loss + vis_loss + conf_loss
+                ) * self.track.get("weight", 1.0)
+                total_loss = total_loss + total_track_loss
+                loss_dict["loss_track"] = track_loss
+                loss_dict["loss_vis_track"] = vis_loss
+                loss_dict["loss_conf_track"] = conf_loss
         
+        # Reprojection loss — jointly constrains predicted depth + poses via GT plane tracks
+        if (
+            self.reproj is not None
+            and "pose_enc_list" in predictions
+            and "depth" in predictions
+            and "tracks" in batch
+        ):
+            reproj_loss = compute_reprojection_loss(predictions, batch, **self.reproj)
+            if reproj_loss is not None:
+                total_loss = total_loss + reproj_loss * self.reproj.get("weight", 1.0)
+                loss_dict["loss_reproj"] = reproj_loss
+
         loss_dict["objective"] = total_loss
 
         return loss_dict
@@ -196,10 +233,45 @@ def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     return loss_T, loss_R, loss_FL
 
 
-def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
+def masked_conf_penalty(conf, valid_mask, invalid_conf_weight=0.0, invalid_conf_target=1.0, invalid_conf_loss_type="l2"):
+    """
+    Explicitly push confidence LOW at invalid (masked/zeroed) pixels.
+
+    At pixels excluded from the depth loss (dynamic objects, plane), the
+    confidence head receives no gradient from the regression loss. This term
+    fills that gap by directly supervising conf toward its minimum value
+    (1.0 for expp1 activation which has range [1, ∞)).
+
+    Args:
+        conf:                (B, S, H, W) predicted confidence map
+        valid_mask:          (B, S, H, W) bool — True where depth loss fires
+        invalid_conf_weight: scalar weight for this penalty (e.g. 0.05)
+        invalid_conf_target: target conf at invalid pixels (1.0 = minimum for expp1)
+        invalid_conf_loss_type: "l2" or "l1"
+    """
+    if invalid_conf_weight <= 0:
+        return (conf * 0.0).mean()
+
+    invalid_mask = ~valid_mask.bool()
+    if invalid_mask.sum() == 0:
+        return (conf * 0.0).mean()
+
+    invalid_conf = conf[invalid_mask]
+    target       = torch.full_like(invalid_conf, fill_value=invalid_conf_target)
+
+    if invalid_conf_loss_type == "l1":
+        penalty = (invalid_conf - target).abs().mean()
+    else:
+        penalty = ((invalid_conf - target) ** 2).mean()
+
+    penalty = check_and_fix_inf_nan(penalty, "loss_mask_conf")
+    return invalid_conf_weight * penalty
+
+
+def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn=None, valid_range=-1, **kwargs):
     """
     Compute point loss.
-    
+
     Args:
         predictions: Dict containing 'world_points' and 'world_points_conf'
         batch: Dict containing ground truth 'world_points' and 'point_masks'
@@ -207,39 +279,55 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
         alpha: Weight for confidence regularization
         gradient_loss_fn: Type of gradient loss to apply
         valid_range: Quantile range for outlier filtering
+        invalid_conf_weight: Weight for masked-region conf penalty (default 0)
+        invalid_conf_target: Target conf at masked pixels (default 1.0)
+        invalid_conf_loss_type: "l2" or "l1" (default "l2")
     """
-    pred_points = predictions['world_points']
+    invalid_conf_weight    = float(kwargs.get("invalid_conf_weight", 0.0))
+    invalid_conf_target    = float(kwargs.get("invalid_conf_target", 1.0))
+    invalid_conf_loss_type = kwargs.get("invalid_conf_loss_type", "l2")
+
+    pred_points      = predictions['world_points']
     pred_points_conf = predictions['world_points_conf']
-    gt_points = batch['world_points']
-    gt_points_mask = batch['point_masks']
-    
+    gt_points        = batch['world_points']
+    gt_points_mask   = batch['point_masks']
+
     gt_points = check_and_fix_inf_nan(gt_points, "gt_points")
-    
+
+    loss_mask_conf = masked_conf_penalty(
+        conf=pred_points_conf,
+        valid_mask=gt_points_mask,
+        invalid_conf_weight=invalid_conf_weight,
+        invalid_conf_target=invalid_conf_target,
+        invalid_conf_loss_type=invalid_conf_loss_type,
+    )
+
     if gt_points_mask.sum() < 100:
-        # If there are less than 100 valid points, skip this batch
         dummy_loss = (0.0 * pred_points).mean()
-        loss_dict = {f"loss_conf_point": dummy_loss,
-                    f"loss_reg_point": dummy_loss,
-                    f"loss_grad_point": dummy_loss,}
-        return loss_dict
-    
-    # Compute confidence-weighted regression loss with optional gradient loss
-    loss_conf, loss_grad, loss_reg = regression_loss(pred_points, gt_points, gt_points_mask, conf=pred_points_conf,
-                                             gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range)
-    
-    loss_dict = {
-        f"loss_conf_point": loss_conf,
-        f"loss_reg_point": loss_reg,
-        f"loss_grad_point": loss_grad,
+        return {
+            "loss_conf_point":      dummy_loss,
+            "loss_reg_point":       dummy_loss,
+            "loss_grad_point":      dummy_loss,
+            "loss_mask_conf_point": loss_mask_conf,
+        }
+
+    loss_conf, loss_grad, loss_reg = regression_loss(
+        pred_points, gt_points, gt_points_mask, conf=pred_points_conf,
+        gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range,
+    )
+
+    return {
+        "loss_conf_point":      loss_conf,
+        "loss_reg_point":       loss_reg,
+        "loss_grad_point":      loss_grad,
+        "loss_mask_conf_point": loss_mask_conf,
     }
-    
-    return loss_dict
 
 
-def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
+def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn=None, valid_range=-1, **kwargs):
     """
     Compute depth loss.
-    
+
     Args:
         predictions: Dict containing 'depth' and 'depth_conf'
         batch: Dict containing ground truth 'depths' and 'point_masks'
@@ -247,35 +335,51 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
         alpha: Weight for confidence regularization
         gradient_loss_fn: Type of gradient loss to apply
         valid_range: Quantile range for outlier filtering
+        invalid_conf_weight: Weight for masked-region conf penalty (default 0)
+        invalid_conf_target: Target conf at masked pixels (default 1.0)
+        invalid_conf_loss_type: "l2" or "l1" (default "l2")
     """
-    pred_depth = predictions['depth']
+    invalid_conf_weight    = float(kwargs.get("invalid_conf_weight", 0.0))
+    invalid_conf_target    = float(kwargs.get("invalid_conf_target", 1.0))
+    invalid_conf_loss_type = kwargs.get("invalid_conf_loss_type", "l2")
+
+    pred_depth      = predictions['depth']
     pred_depth_conf = predictions['depth_conf']
 
-    gt_depth = batch['depths']
-    gt_depth = check_and_fix_inf_nan(gt_depth, "gt_depth")
-    gt_depth = gt_depth[..., None]              # (B, H, W, 1)
-    gt_depth_mask = batch['point_masks'].clone()   # 3D points derived from depth map, so we use the same mask
+    gt_depth      = batch['depths']
+    gt_depth      = check_and_fix_inf_nan(gt_depth, "gt_depth")
+    gt_depth      = gt_depth[..., None]                    # (B, S, H, W, 1)
+    gt_depth_mask = batch['point_masks'].clone()           # False at plane + dynamic object pixels
+
+    loss_mask_conf = masked_conf_penalty(
+        conf=pred_depth_conf,
+        valid_mask=gt_depth_mask,
+        invalid_conf_weight=invalid_conf_weight,
+        invalid_conf_target=invalid_conf_target,
+        invalid_conf_loss_type=invalid_conf_loss_type,
+    )
 
     if gt_depth_mask.sum() < 100:
-        # If there are less than 100 valid points, skip this batch
         dummy_loss = (0.0 * pred_depth).mean()
-        loss_dict = {f"loss_conf_depth": dummy_loss,
-                    f"loss_reg_depth": dummy_loss,
-                    f"loss_grad_depth": dummy_loss,}
-        return loss_dict
+        return {
+            "loss_conf_depth":      dummy_loss,
+            "loss_reg_depth":       dummy_loss,
+            "loss_grad_depth":      dummy_loss,
+            "loss_mask_conf_depth": loss_mask_conf,
+        }
 
-    # NOTE: we put conf inside regression_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
-    # this is hacky, but very easier to implement
-    loss_conf, loss_grad, loss_reg = regression_loss(pred_depth, gt_depth, gt_depth_mask, conf=pred_depth_conf,
-                                             gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range)
+    # NOTE: conf is passed into regression_loss so it applies to the gradient loss too
+    loss_conf, loss_grad, loss_reg = regression_loss(
+        pred_depth, gt_depth, gt_depth_mask, conf=pred_depth_conf,
+        gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range,
+    )
 
-    loss_dict = {
-        f"loss_conf_depth": loss_conf,
-        f"loss_reg_depth": loss_reg,    
-        f"loss_grad_depth": loss_grad,
+    return {
+        "loss_conf_depth":      loss_conf,
+        "loss_reg_depth":       loss_reg,
+        "loss_grad_depth":      loss_grad,
+        "loss_mask_conf_depth": loss_mask_conf,
     }
-
-    return loss_dict
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):
@@ -675,73 +779,169 @@ def torch_quantile(
     return out
 
 
-########################################################################################
-########################################################################################
+def compute_track_loss(coord_preds, vis_scores, conf_scores, batch, gamma=0.8, **kwargs):
+    """Compute tracking losses over all refinement iterations.
 
-# Dirty code for tracking loss:
+    Args:
+        coord_preds: list of (B, S, N, 2) predicted coordinates per iteration
+        vis_scores:  (B, S, N) raw visibility logits
+        conf_scores: (B, S, N) raw confidence logits, or None
+        batch:       dict with "tracks" (B, S, N, 2) and "track_vis_mask" (B, S, N bool)
+        gamma:       per-iteration loss weighting (later iterations weighted higher)
 
-########################################################################################
-########################################################################################
+    Returns:
+        track_loss, vis_loss, conf_loss  — three scalar tensors
+    """
+    gt_tracks = batch["tracks"]          # B, S, N, 2
+    gt_track_vis_mask = batch["track_vis_mask"]  # B, S, N  (bool)
 
-'''
-def _compute_losses(self, coord_preds, vis_scores, conf_scores, batch):
-    """Compute tracking losses using sequence_loss"""
-    gt_tracks = batch["tracks"]  # B, S, N, 2
-    gt_track_vis_mask = batch["track_vis_mask"]  # B, S, N
-
-    # if self.training and hasattr(self, "train_query_points"):
-    train_query_points = coord_preds[-1].shape[2]
-    gt_tracks = gt_tracks[:, :, :train_query_points]
+    # Trim to the number of query points the model actually predicted
+    n_query = coord_preds[-1].shape[2]
+    gt_tracks = gt_tracks[:, :, :n_query]
     gt_tracks = check_and_fix_inf_nan(gt_tracks, "gt_tracks", hard_max=None)
+    gt_track_vis_mask = gt_track_vis_mask[:, :, :n_query]
 
-    gt_track_vis_mask = gt_track_vis_mask[:, :, :train_query_points]
-
-    # Create validity mask that filters out tracks not visible in first frame
+    # Valid mask: only supervise tracks that are visible in the first (query) frame
     valids = torch.ones_like(gt_track_vis_mask)
-    mask = gt_track_vis_mask[:, 0, :] == True
-    valids = valids * mask.unsqueeze(1)
+    first_frame_visible = gt_track_vis_mask[:, 0, :]  # B, N
+    valids = valids * first_frame_visible.unsqueeze(1)
 
-
+    valids = valids.bool()  # ensure bool for indexing
 
     if not valids.any():
-        print("No valid tracks found in first frame")
-        print("seq_name: ", batch["seq_name"])
-        print("ids: ", batch["ids"])
-        print("time: ", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+        return None, None, None
 
-        dummy_coord = coord_preds[0].mean() * 0          # keeps graph & grads
-        dummy_vis = vis_scores.mean() * 0
-        if conf_scores is not None:
-            dummy_conf = conf_scores.mean() * 0
-        else:
-            dummy_conf = 0
-        return dummy_coord, dummy_vis, dummy_conf                # three scalar zeros
-
-
-    # Compute tracking loss using sequence_loss
     track_loss = sequence_loss(
         flow_preds=coord_preds,
         flow_gt=gt_tracks,
         vis=gt_track_vis_mask,
         valids=valids,
-        **self.loss_kwargs
+        gamma=gamma,
     )
 
-    vis_loss = F.binary_cross_entropy_with_logits(vis_scores[valids], gt_track_vis_mask[valids].float())
-
+    vis_loss = F.binary_cross_entropy_with_logits(
+        vis_scores[valids], gt_track_vis_mask[valids].float()
+    )
     vis_loss = check_and_fix_inf_nan(vis_loss, "vis_loss", hard_max=None)
 
-
-    # within 3 pixels
     if conf_scores is not None:
         gt_conf_mask = (gt_tracks - coord_preds[-1]).norm(dim=-1) < 3
-        conf_loss = F.binary_cross_entropy_with_logits(conf_scores[valids], gt_conf_mask[valids].float())
+        conf_loss = F.binary_cross_entropy_with_logits(
+            conf_scores[valids], gt_conf_mask[valids].float()
+        )
         conf_loss = check_and_fix_inf_nan(conf_loss, "conf_loss", hard_max=None)
     else:
-        conf_loss = 0
+        conf_loss = torch.tensor(0.0, device=vis_loss.device)
 
     return track_loss, vis_loss, conf_loss
 
+
+def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
+    """
+    Reprojection loss that jointly constrains predicted depth and predicted poses
+    using GT plane (AE) tracks.
+
+    For each GT track point visible in frame 0:
+      1. Sample predicted depth at that pixel location.
+      2. Unproject to 3D world coords via predicted extrinsics/intrinsics of frame 0.
+      3. Reproject into every other frame via predicted extrinsics/intrinsics.
+      4. L1 error against GT track positions.
+
+    Args:
+        predictions: dict with "pose_enc_list" (list of B,S,9) and "depth" (B,S,H,W,1)
+        batch:       dict with "tracks" (B,S,N,2) and "track_vis_mask" (B,S,N bool)
+        weight:      scalar weight (absorbed by caller, kept for **kwargs compatibility)
+
+    Returns:
+        Scalar loss tensor, or None if no valid tracks.
+    """
+    if "tracks" not in batch or batch["tracks"] is None:
+        return None
+
+    gt_tracks = batch["tracks"]       # B, S, N, 2
+    gt_vis    = batch["track_vis_mask"]  # B, S, N (bool)
+
+    B, S, N, _ = gt_tracks.shape
+
+    first_vis = gt_vis[:, 0, :]       # B, N — tracks visible in frame 0
+    if not first_vis.any():
+        return None
+
+    image_hw = batch["images"].shape[-2:]   # (H, W)
+    H, W = image_hw
+
+    # Decode last-stage pose encoding → extrinsics (B,S,3,4), intrinsics (B,S,3,3)
+    pred_pose_enc = predictions["pose_enc_list"][-1]   # B, S, 9
+    pred_extrinsics, pred_intrinsics = pose_encoding_to_extri_intri(pred_pose_enc, image_hw)
+
+    # Predicted depth for frame 0: (B, H, W)
+    pred_depth_0 = predictions["depth"][:, 0, :, :, 0]   # B, H, W
+
+    # GT track coords in frame 0: (B, N, 2)  [u=col, v=row]
+    track0 = gt_tracks[:, 0, :, :]   # B, N, 2
+
+    # --- Sample depth at track positions via bilinear interpolation ---
+    norm_u = (track0[..., 0] / (W - 1)) * 2.0 - 1.0   # B, N
+    norm_v = (track0[..., 1] / (H - 1)) * 2.0 - 1.0   # B, N
+    grid   = torch.stack([norm_u, norm_v], dim=-1).unsqueeze(1)   # B, 1, N, 2
+
+    sampled_depth = F.grid_sample(
+        pred_depth_0.unsqueeze(1),   # B, 1, H, W
+        grid,
+        mode="bilinear",
+        align_corners=True,
+    )  # B, 1, 1, N
+    sampled_depth = sampled_depth.squeeze(1).squeeze(1)   # B, N
+
+    # --- Unproject frame-0 tracks to world 3D ---
+    K0     = pred_intrinsics[:, 0, :, :]   # B, 3, 3
+    K0_inv = torch.linalg.inv(K0)          # B, 3, 3
+
+    ones  = torch.ones_like(track0[..., :1])
+    uvh   = torch.cat([track0, ones], dim=-1)           # B, N, 3
+    rays  = torch.bmm(uvh, K0_inv.transpose(-1, -2))    # B, N, 3  (cam-space rays)
+    cam_pts_0 = rays * sampled_depth.unsqueeze(-1)       # B, N, 3
+
+    E0 = pred_extrinsics[:, 0, :, :]   # B, 3, 4
+    R0 = E0[:, :, :3]                  # B, 3, 3
+    t0 = E0[:, :, 3]                   # B, 3
+
+    # P_world = R0^T @ (P_cam - t0)
+    world_pts = torch.bmm(cam_pts_0 - t0.unsqueeze(1), R0)   # B, N, 3
+
+    # --- Reproject to all S frames ---
+    total_loss = 0.0
+    n_valid    = 0
+
+    for j in range(S):
+        valid_j = first_vis & gt_vis[:, j, :]   # B, N
+        if not valid_j.any():
+            continue
+
+        Ej = pred_extrinsics[:, j, :, :]   # B, 3, 4
+        Rj = Ej[:, :, :3]                  # B, 3, 3
+        tj = Ej[:, :, 3]                   # B, 3
+        Kj = pred_intrinsics[:, j, :, :]   # B, 3, 3
+
+        # P_cam_j = R_j @ P_world + t_j
+        cam_pts_j = torch.bmm(world_pts, Rj.transpose(-1, -2)) + tj.unsqueeze(1)  # B, N, 3
+
+        # Project: [u, v] = K_j @ P_cam_j / z
+        proj = torch.bmm(cam_pts_j, Kj.transpose(-1, -2))   # B, N, 3
+        z    = proj[..., 2:3].clamp(min=1e-3)
+        uv_pred = proj[..., :2] / z   # B, N, 2
+
+        err = (uv_pred - gt_tracks[:, j, :, :]).abs().mean(dim=-1)   # B, N
+        err = check_and_fix_inf_nan(err, f"reproj_err_j{j}", hard_max=None)
+        err = err.clamp(max=100.0)
+
+        total_loss = total_loss + err[valid_j].mean()
+        n_valid    += 1
+
+    if n_valid == 0:
+        return None
+
+    return total_loss / n_valid
 
 
 def reduce_masked_mean(x, mask, dim=None, keepdim=False):
@@ -757,53 +957,42 @@ def reduce_masked_mean(x, mask, dim=None, keepdim=False):
         denom = torch.sum(mask, dim=dim, keepdim=keepdim)
 
     mean = numer / denom.clamp(min=1)
-    mean = torch.where(denom > 0,
-                       mean,
-                       torch.zeros_like(mean))
+    mean = torch.where(denom > 0, mean, torch.zeros_like(mean))
     return mean
 
 
-def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, huber=False, delta=10, vis_aware_w=0.1, **kwargs):
-    """Loss function defined over sequence of flow predictions"""
+def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, vis_aware_w=0.1, **kwargs):
+    """Loss function defined over sequence of flow predictions."""
     B, S, N, D = flow_gt.shape
     assert D == 2
-    B, S1, N = vis.shape
-    B, S2, N = valids.shape
-    assert S == S1
-    assert S == S2
+    assert vis.shape == (B, S, N)
+    assert valids.shape == (B, S, N)
+
     n_predictions = len(flow_preds)
     flow_loss = 0.0
 
     for i in range(n_predictions):
         i_weight = gamma ** (n_predictions - i - 1)
-        flow_pred = flow_preds[i]
-
-        i_loss = (flow_pred - flow_gt).abs()  # B, S, N, 2
+        i_loss = (flow_preds[i] - flow_gt).abs()          # B, S, N, 2
         i_loss = check_and_fix_inf_nan(i_loss, f"i_loss_iter_{i}", hard_max=None)
+        i_loss = torch.mean(i_loss, dim=3)                 # B, S, N
 
-        i_loss = torch.mean(i_loss, dim=3) # B, S, N
-
-        # Combine valids and vis for per-frame valid masking.
         combined_mask = torch.logical_and(valids, vis)
-
-        num_valid_points = combined_mask.sum()
+        num_valid = combined_mask.sum()
 
         if vis_aware:
-            combined_mask = combined_mask.float() * (1.0 + vis_aware_w)  # Add, don't add to the mask itself.
+            combined_mask = combined_mask.float() * (1.0 + vis_aware_w)
             flow_loss += i_weight * reduce_masked_mean(i_loss, combined_mask)
         else:
-            if num_valid_points > 2:
-                i_loss = i_loss[combined_mask]
-                flow_loss += i_weight * i_loss.mean()
+            if num_valid > 2:
+                flow_loss += i_weight * i_loss[combined_mask].mean()
             else:
-                i_loss = check_and_fix_inf_nan(i_loss, f"i_loss_iter_safe_check_{i}", hard_max=None)
+                i_loss = check_and_fix_inf_nan(i_loss, f"i_loss_safe_{i}", hard_max=None)
                 flow_loss += 0 * i_loss.mean()
 
-    # Avoid division by zero if n_predictions is 0 (though it shouldn't be).
     if n_predictions > 0:
         flow_loss = flow_loss / n_predictions
 
     return flow_loss
-'''
 
 

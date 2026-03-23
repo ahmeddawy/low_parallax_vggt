@@ -249,8 +249,12 @@ class Trainer:
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
 
-        # Freeze specified model parameters if any
-        if getattr(self.optim_conf, "frozen_module_names", None):
+        # LoRA and freezing are mutually exclusive.
+        # LoRA: PEFT marks all non-adapter params as requires_grad=False internally,
+        #       so frozen_module_names must be null when lora is enabled.
+        if getattr(self.optim_conf, "lora", None):
+            self._setup_lora()
+        elif getattr(self.optim_conf, "frozen_module_names", None):
             logging.info(
                 f"[Start] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
             )
@@ -269,6 +273,55 @@ class Trainer:
             logging.info(f"Model summary saved to {model_summary_path}")
 
         logging.info("Successfully initialized training components.")
+
+    def _setup_lora(self):
+        """Load pretrained weights into the full model, then wrap model.aggregator with LoRA via PEFT.
+
+        Must be called BEFORE DDP wrapping. Mutually exclusive with frozen_module_names.
+
+        Config (optim.lora):
+            pretrained_checkpoint_path: str  — full model checkpoint loaded before LoRA wrapping
+                                               so base-layer keys still match.
+            r:                          int  — LoRA rank (e.g. 16)
+            lora_alpha:                 float — LoRA scaling (e.g. 32); effective LR scale = alpha/r
+            target_modules:             list  — attention layer names to adapt (e.g. [qkv, proj])
+            lora_dropout:               float — dropout on LoRA layers (default 0.0)
+            fresh_heads:                bool  — if True, only aggregator weights are loaded from
+                                               the checkpoint; heads keep their random init.
+                                               Set False to keep pretrained heads (domain fine-tuning).
+        """
+        from peft import LoraConfig, get_peft_model
+
+        lora_conf = self.optim_conf.lora
+
+        # Load pretrained weights BEFORE wrapping so base-layer key names still match.
+        pretrained_path = getattr(lora_conf, "pretrained_checkpoint_path", None)
+        if pretrained_path is not None:
+            logging.info(f"LoRA: loading pretrained weights from {pretrained_path} (rank {self.rank})")
+            with g_pathmgr.open(pretrained_path, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
+            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            if getattr(lora_conf, "fresh_heads", False):
+                # Aggregator-only restore — heads keep random init (ablation mode).
+                state_dict = {k: v for k, v in state_dict.items() if k.startswith("aggregator.")}
+                logging.info("LoRA: fresh_heads=True — loading aggregator weights only, heads stay randomly initialized.")
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+            if self.rank == 0:
+                logging.info(f"LoRA pretrained load — missing: {missing or 'None'}, unexpected: {unexpected or 'None'}")
+
+        # Wrap only model.aggregator — heads remain plain nn.Modules and are fully trainable.
+        lora_config = LoraConfig(
+            r=int(lora_conf.r),
+            lora_alpha=float(lora_conf.lora_alpha),
+            target_modules=list(lora_conf.target_modules),
+            lora_dropout=float(getattr(lora_conf, "lora_dropout", 0.0)),
+            bias="none",
+        )
+        self.model.aggregator = get_peft_model(self.model.aggregator, lora_config)
+
+        if self.rank == 0:
+            logging.info("LoRA applied to model.aggregator:")
+            self.model.aggregator.print_trainable_parameters()
 
     def _setup_dataloaders(self):
         """Initializes train and validation datasets and dataloaders."""
@@ -743,7 +796,12 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        y_hat = model(images=batch["images"])
+        # Use first-frame track positions as query points if tracks are available
+        if "tracks" in batch and batch["tracks"] is not None:
+            query_points = batch["tracks"][:, 0, :, :]  # (B, N, 2)
+        else:
+            query_points = None
+        y_hat = model(images=batch["images"], query_points=query_points)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
