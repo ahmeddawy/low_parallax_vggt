@@ -731,7 +731,7 @@ class Trainer:
 
 
                 loss = loss_dict["objective"]
-                loss_key = f"Loss/{phase}_loss_objective"
+                loss_key = f"Loss/{phase}_objective"
                 batch_size = chunked_batch["images"].shape[0]
 
                 if not math.isfinite(loss.item()):
