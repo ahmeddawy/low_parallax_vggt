@@ -167,7 +167,7 @@ loss:
     loss_type: "l1"
 
   depth:
-    weight: 1.0
+    weight: 0.5                # Reduced from 1.0 — depth grad loss was exploding (norm 388 pre-clip), causing NaN reprojection
     gradient_loss_fn: "grad"
     valid_range: 0.95          # More aggressive outlier filtering — pseudo GT depth (ViPE) has more noise than LiDAR
     invalid_conf_weight: 0.0    # Disabled: was collapsing conf→1.0 everywhere (outdoor seqs have sparse valid depth)
@@ -207,7 +207,7 @@ optim:
         max_norm: 1.0
         norm_type: 2
       - module_name: ["depth"]
-        max_norm: 1.0
+        max_norm: 0.5          # Tightened from 1.0 — depth grads were hitting 388 pre-clip
         norm_type: 2
       - module_name: ["camera"]
         max_norm: 1.0

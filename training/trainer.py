@@ -625,9 +625,17 @@ class Trainer:
             else:
                 chunked_batches = chunk_batch_for_accum_steps(batch, accum_steps)
 
-            self._run_steps_on_batch_chunks(
+            did_backward = self._run_steps_on_batch_chunks(
                 chunked_batches, phase, loss_meters
             )
+
+            if not did_backward:
+                # NaN/Inf loss — backward was skipped, reset scaler and skip this batch
+                self.scaler.update()
+                for optim in self.optims:
+                    optim.zero_grad(set_to_none=True)
+                end = time.time()
+                continue
 
             # compute gradient and do SGD step
             assert data_iter <= limit_train_batches  # allow for off by one errors
@@ -743,13 +751,14 @@ class Trainer:
                 batch_size = chunked_batch["images"].shape[0]
 
                 if not math.isfinite(loss.item()):
-                    error_msg = f"Loss is {loss.item()}, attempting to stop training"
-                    logging.error(error_msg)
-                    return
+                    logging.error(f"Loss is {loss.item()} at step {i}, skipping batch")
+                    return False
 
                 loss /= accum_steps
                 self.scaler.scale(loss).backward()
                 loss_meters[loss_key].update(loss.item(), batch_size)
+
+        return True
 
 
     def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
