@@ -81,3 +81,13 @@ def setup_logging(
         logger.addHandler(file_handler)
 
     logging.root = logger
+
+    # Route uncaught exceptions through the logger so they appear in log.txt.
+    # Without this, Python writes tracebacks to stderr which bypasses the file handler.
+    def _log_uncaught_exception(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = _log_uncaught_exception
