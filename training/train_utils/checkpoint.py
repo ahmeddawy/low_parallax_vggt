@@ -73,19 +73,36 @@ def robust_torch_save(checkpoint: Dict[str, Any], checkpoint_path: str) -> None:
     """
     A more robust version of torch.save that works better with preemptions
     and corruptions if a job is preempted during save.
+
+    Always saves to a local temp file first, then copies to the destination.
+    This avoids corruption when writing large files to GCS FUSE mounts, where
+    streaming writes can leave truncated files if the process is interrupted.
     """
-    # Move the existing checkpoint to a backup location
-    backup_checkpoint_path = checkpoint_path + ".bak"
-    backup_checkpoint_path_saved = False
-    if g_pathmgr.exists(checkpoint_path):
-        assert not g_pathmgr.exists(
-            backup_checkpoint_path
-        ), f"this should not exist... {backup_checkpoint_path}"
-        g_pathmgr.mv(checkpoint_path, backup_checkpoint_path)
-        backup_checkpoint_path_saved = True
-    # Save the checkpoint
-    with g_pathmgr.open(checkpoint_path, "wb") as f:
-        torch.save(checkpoint, f)
-    # Remove the backup checkpoint
-    if backup_checkpoint_path_saved:
-        g_pathmgr.rm(backup_checkpoint_path)
+    import tempfile
+    import shutil
+
+    # Save to a local temp file atomically first
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pt")
+    try:
+        os.close(tmp_fd)
+        torch.save(checkpoint, tmp_path)
+
+        # Move the existing checkpoint to a backup location
+        backup_checkpoint_path = checkpoint_path + ".bak"
+        backup_checkpoint_path_saved = False
+        if g_pathmgr.exists(checkpoint_path):
+            if g_pathmgr.exists(backup_checkpoint_path):
+                g_pathmgr.rm(backup_checkpoint_path)
+            g_pathmgr.mv(checkpoint_path, backup_checkpoint_path)
+            backup_checkpoint_path_saved = True
+
+        # Copy the fully-written local file to the destination
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        shutil.copy2(tmp_path, checkpoint_path)
+
+        # Remove the backup checkpoint
+        if backup_checkpoint_path_saved:
+            g_pathmgr.rm(backup_checkpoint_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
