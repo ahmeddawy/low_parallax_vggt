@@ -955,12 +955,19 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
 
         # Project: [u, v] = K_j @ P_cam_j / z
         proj = torch.bmm(cam_pts_j, Kj.transpose(-1, -2))   # B, N, 3
-        z    = proj[..., 2:3].clamp(min=1e-3)
+        # Tighter z clamp: min=0.1 instead of 1e-3.
+        # At the clamp boundary, d(uv)/d(cam) = 1/z. With 1e-3 → gradient=1000;
+        # with 0.1 → gradient=10. This is the primary source of reproj gradient spikes.
+        z    = proj[..., 2:3].clamp(min=0.1)
         uv_pred = proj[..., :2] / z   # B, N, 2
 
-        err = (uv_pred - gt_tracks[:, j, :, :]).abs().mean(dim=-1)   # B, N
+        # Huber loss (smooth_l1, delta=1.0px): quadratic for |err|<1px, linear above.
+        # More robust than L1 — reduces gradient for moderately-large errors while
+        # still penalising large outliers. Tighter clamp (5px) catches bad batches early.
+        diff = uv_pred - gt_tracks[:, j, :, :]          # B, N, 2
+        err = F.huber_loss(diff, torch.zeros_like(diff), delta=1.0, reduction='none').mean(dim=-1)  # B, N
         err = check_and_fix_inf_nan(err, f"reproj_err_j{j}", hard_max=None)
-        err = err.clamp(max=100.0)
+        err = err.clamp(max=5.0)
 
         total_loss = total_loss + err[valid_j].mean()
         n_valid    += 1

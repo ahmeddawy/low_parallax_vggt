@@ -1,12 +1,12 @@
-exp_name: rembrand_lora_r16_no_reproj_v1
-# No reproj loss. Confirmed instability source: both masked_depth and regular_depth hit identical
-# NaN crash pattern (loss_reg inf/nan at step ~23, triggered by reproj spike) — masked_depth at E3, regular_depth at E4.
-# Supervision: ViPE masked depth + COLMAP camera (weight=0.5) + GT track head supervision.
-# v2: depth weight 0.5, depth clip 0.5, track_num 256, invalid_conf_weight 0.0, NaN batch skip.
-# v3: gradient_loss_fn disabled ("none") — "grad" spikes at plane-mask boundaries.
-# v4: reproj NaN gradient fix (sampled_depth clamp + analytical K^{-1}).
-# v5: alpha raised 0.5→1.0, camera grad clip tightened 1.0→0.5.
-# v6: camera.weight set to 0.0 (COLMAP unreliable) — reverted to 0.5 since reproj is now disabled.
+exp_name: rembrand_lora_r16_reproj_huber_v1
+# Reproj re-enabled with stability fixes (branch: reproj-huber-stable).
+# Root cause of prior crashes: L1 reproj + z.clamp(min=1e-3) → gradient 1000x at boundary.
+# Fixes:
+#   1. Huber loss (delta=1.0px): quadratic <1px, linear above — robust to outliers
+#   2. z.clamp(min=0.1): max gradient from 1/z drops 1000→10
+#   3. err.clamp(max=5.0): hard cap per-track error (was 100.0px — far too loose)
+# Running in parallel with rembrand_lora_r16_no_reproj_v2 for direct comparison.
+# Supervision: ViPE masked depth + COLMAP camera (weight=0.5) + GT tracks + reproj (weight=1.0).
 img_size: 518         # 1920×1080 → 518×291 at 16:9 (scale ≈0.27×). 1 model-px ≈ 3.7 original-px → ~4px precision floor.
 num_workers: 8
 seed_value: 42
@@ -184,7 +184,8 @@ loss:
   track:
     weight: 1.0
 
-  reproj: null  # Disabled for diagnostic — null skips compute_reprojection_loss entirely (weight=0 still calls it)
+  reproj:
+    weight: 1.0   # Huber + z-clamp(0.1) + err-clamp(5.0) — see loss.py compute_reprojection_loss
 
 
 optim:
