@@ -1,4 +1,4 @@
-exp_name: rembrand_lora_r16_reproj_masked_depth_v3
+exp_name: rembrand_lora_r16_reproj_masked_depth_v5
 # Experiment: LoRA fine-tuning (r=16) of VGGT aggregator on 83 outdoor fixed/low-parallax sequences.
 # Supervision: ViPE masked depth (plane+dynamic zeroed) + reprojection loss from AE GT plane tracks
 #              + direct track head supervision + weak COLMAP camera loss.
@@ -6,6 +6,9 @@ exp_name: rembrand_lora_r16_reproj_masked_depth_v3
 # v2: depth weight 0.5, depth clip 0.5, track_num 256, invalid_conf_weight 0.0, NaN batch skip.
 # v3: gradient_loss_fn disabled ("none") — "grad" was spiking at plane-mask boundaries (loss_grad_depth→4+, Grad/depth 200-314 pre-clip, NaN reproj).
 #     alpha raised to 0.5 (conf_eq = 2.5 > expp1 minimum 1.0 → prevents conf collapse).
+# v4: reproj NaN gradient fix (sampled_depth clamp + analytical K^{-1}).
+# v5: alpha raised 0.5→1.0 (conf_eq = 1/loss_reg ≥ 1 for loss_reg ≤ 1.0 — prevents partial collapse on high-error batches).
+#     camera grad clip tightened 1.0→0.5 (Grad/camera was hitting 360 pre-clip, more volatile than depth).
 img_size: 518         # 1920×1080 → 518×291 at 16:9 (scale ≈0.27×). 1 model-px ≈ 3.7 original-px → ~4px precision floor.
 num_workers: 8
 seed_value: 42
@@ -173,7 +176,7 @@ loss:
     weight: 0.5                # Reduced from 1.0 — depth grad loss was exploding (norm 388 pre-clip), causing NaN reprojection
     gradient_loss_fn: "none"       # Disabled: "grad" spikes at plane-mask boundaries (valid→0 transitions), causing loss_grad_depth→4+ and NaN reproj
     valid_range: 0.95          # More aggressive outlier filtering — pseudo GT depth (ViPE) has more noise than LiDAR
-    alpha: 0.5                 # Raised from 0.2 — conf_eq = alpha/loss_reg; at loss_reg≈0.2, alpha=0.2 → conf_eq=1.0 (expp1 min) → collapse. alpha=0.5 → conf_eq=2.5 > 1.0
+    alpha: 1.0                 # Raised from 0.5 — conf_eq = alpha/loss_reg; needs alpha > loss_reg to stay above expp1 min 1.0. Some batches have loss_reg≈0.65 → alpha=0.5 gives conf_eq=0.77 < 1.0 → collapse. alpha=1.0 → conf_eq≥1 as long as loss_reg≤1.0.
     invalid_conf_weight: 0.0    # Disabled: was collapsing conf→1.0 everywhere (outdoor seqs have sparse valid depth)
     invalid_conf_target: 1.0    # expp1 activation minimum = 1.0
     invalid_conf_loss_type: "l2"
@@ -214,7 +217,7 @@ optim:
         max_norm: 0.5          # Tightened from 1.0 — depth grads were hitting 388 pre-clip
         norm_type: 2
       - module_name: ["camera"]
-        max_norm: 1.0
+        max_norm: 0.5          # Tightened from 1.0 — Grad/camera was hitting 360 pre-clip, far more volatile than depth
         norm_type: 2
       - module_name: ["track"]
         max_norm: 1.0
