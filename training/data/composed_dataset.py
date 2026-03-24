@@ -163,6 +163,19 @@ class ComposedDataset(Dataset, ABC):
                 gt_tracks = gt_tracks[:, sampled, :]
                 gt_vis_mask = gt_vis_mask[:, sampled]
 
+                # Pad to track_num so all samples collate to the same size.
+                # Sequences with fewer tracks than track_num get zero-padded
+                # slots with visibility=False (they contribute no loss).
+                if n_gt < self.track_num:
+                    pad = self.track_num - n_gt
+                    S = gt_tracks.shape[0]
+                    gt_tracks = torch.cat(
+                        [gt_tracks, torch.zeros(S, pad, 2, dtype=gt_tracks.dtype)], dim=1
+                    )
+                    gt_vis_mask = torch.cat(
+                        [gt_vis_mask, torch.zeros(S, pad, dtype=torch.bool)], dim=1
+                    )
+
             # --- Depth-based background tracks (on-the-fly) ---
             # Fill remaining slots up to track_num
             if self.use_depth_tracks:
