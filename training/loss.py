@@ -924,6 +924,9 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
 
     # P_world = R0^T @ (P_cam - t0)
     world_pts = torch.bmm(cam_pts_0 - t0.unsqueeze(1), R0)   # B, N, 3
+    # Clamp world points — if camera predictions are bad (large t0), world_pts
+    # can overflow bfloat16 bmm in the reprojection loop → Inf*0=NaN backward.
+    world_pts = world_pts.clamp(min=-1e3, max=1e3)
 
     # --- Reproject to all S frames ---
     total_loss = 0.0
@@ -941,6 +944,7 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
 
         # P_cam_j = R_j @ P_world + t_j
         cam_pts_j = torch.bmm(world_pts, Rj.transpose(-1, -2)) + tj.unsqueeze(1)  # B, N, 3
+        cam_pts_j = cam_pts_j.clamp(min=-1e3, max=1e3)  # prevent overflow from large tj
 
         # Project: [u, v] = K_j @ P_cam_j / z
         proj = torch.bmm(cam_pts_j, Kj.transpose(-1, -2))   # B, N, 3

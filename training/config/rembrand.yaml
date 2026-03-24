@@ -161,7 +161,7 @@ checkpoint:
   save_dir: /workspace/low_parallax_vggt/ckpts/${exp_name}
   save_freq: 5
   # Weights are loaded inside _setup_lora() before PEFT wrapping — do NOT also load here.
-  resume_checkpoint_path: null
+  resume_checkpoint_path: /workspace/low_parallax_vggt/ckpts/rembrand_lora_r16_reproj_masked_depth_v4/checkpoint.pt
   strict: False
 
 
