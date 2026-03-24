@@ -1,8 +1,9 @@
-exp_name: rembrand_lora_r16_reproj_masked_depth_v1
+exp_name: rembrand_lora_r16_reproj_masked_depth_v2
 # Experiment: LoRA fine-tuning (r=16) of VGGT aggregator on 83 outdoor fixed/low-parallax sequences.
 # Supervision: ViPE masked depth (plane+dynamic zeroed) + reprojection loss from AE GT plane tracks
 #              + direct track head supervision + weak COLMAP camera loss.
 # Pretrained depth+camera heads; fresh track head (not in base VGGT ckpt).
+# v2: depth weight 0.5, depth clip 0.5, track_num 256, invalid_conf_weight 0.0, NaN batch skip.
 img_size: 518         # 1920×1080 → 518×291 at 16:9 (scale ≈0.27×). 1 model-px ≈ 3.7 original-px → ~4px precision floor.
 num_workers: 8
 seed_value: 42
