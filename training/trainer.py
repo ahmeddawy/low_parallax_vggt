@@ -630,8 +630,8 @@ class Trainer:
             )
 
             if not did_backward:
-                # NaN/Inf loss — backward was skipped, reset scaler and skip this batch
-                self.scaler.update()
+                # NaN/Inf loss — scale()/backward() were never called, so skip ALL
+                # scaler operations (update() also requires prior inf checks)
                 for optim in self.optims:
                     optim.zero_grad(set_to_none=True)
                 end = time.time()
