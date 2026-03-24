@@ -185,8 +185,7 @@ loss:
   track:
     weight: 1.0
 
-  reproj:
-    weight: 0.0   # Disabled for diagnostic — testing stability without reproj
+  reproj: null  # Disabled for diagnostic — null skips compute_reprojection_loss entirely (weight=0 still calls it)
 
 
 optim:
