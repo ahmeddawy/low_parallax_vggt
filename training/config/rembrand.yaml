@@ -1,16 +1,13 @@
-exp_name: rembrand_lora_r16_reproj_masked_depth_v6
-# Experiment: LoRA fine-tuning (r=16) of VGGT aggregator on 83 outdoor fixed/low-parallax sequences.
-# Supervision: ViPE masked depth (plane+dynamic zeroed) + reprojection loss from AE GT plane tracks
-#              + direct track head supervision. No COLMAP camera loss (COLMAP poses unreliable for this dataset).
-# Pretrained depth+camera heads; fresh track head (not in base VGGT ckpt).
+exp_name: rembrand_lora_r16_no_reproj_diag
+# Diagnostic experiment: reproj disabled to isolate whether instability originates from reproj loss.
+# Supervision: ViPE masked depth + COLMAP camera + direct track head supervision. No reproj loss.
+# If training is stable here, reproj loss is the instability source.
 # v2: depth weight 0.5, depth clip 0.5, track_num 256, invalid_conf_weight 0.0, NaN batch skip.
-# v3: gradient_loss_fn disabled ("none") — "grad" was spiking at plane-mask boundaries (loss_grad_depth→4+, Grad/depth 200-314 pre-clip, NaN reproj).
-#     alpha raised to 0.5 (conf_eq = 2.5 > expp1 minimum 1.0 → prevents conf collapse).
+# v3: gradient_loss_fn disabled ("none") — "grad" was spiking at plane-mask boundaries.
 # v4: reproj NaN gradient fix (sampled_depth clamp + analytical K^{-1}).
-# v5: alpha raised 0.5→1.0 (conf_eq = 1/loss_reg ≥ 1 for loss_reg ≤ 1.0 — prevents partial collapse on high-error batches).
-#     camera grad clip tightened 1.0→0.5 (Grad/camera was hitting 360 pre-clip, more volatile than depth).
-# v6: camera.weight set to 0.0 — COLMAP poses for outdoor fixed/low-parallax seqs are unreliable;
-#     reproj (weight=2.0) via AE GT plane tracks is the sole camera supervisor.
+# v5: alpha raised 0.5→1.0, camera grad clip tightened 1.0→0.5.
+# v6: camera.weight set to 0.0 (COLMAP unreliable).
+# diag: reproj.weight set to 0.0 — isolate standard losses (depth + camera + track).
 img_size: 518         # 1920×1080 → 518×291 at 16:9 (scale ≈0.27×). 1 model-px ≈ 3.7 original-px → ~4px precision floor.
 num_workers: 8
 seed_value: 42
@@ -163,7 +160,7 @@ checkpoint:
   save_dir: /workspace/low_parallax_vggt/ckpts/${exp_name}
   save_freq: 5
   # Weights are loaded inside _setup_lora() before PEFT wrapping — do NOT also load here.
-  resume_checkpoint_path: /workspace/low_parallax_vggt/ckpts/rembrand_lora_r16_reproj_masked_depth_v5/checkpoint.pt
+  resume_checkpoint_path: null  # Fresh start — diagnostic run from pretrained base only
   strict: False
 
 
@@ -171,7 +168,7 @@ loss:
   _target_: loss.MultitaskLoss
 
   camera:
-    weight: 0.0             # Disabled — COLMAP poses unreliable for this dataset; reproj (weight=2.0) owns camera via AE GT tracks
+    weight: 0.5             # Restored for diagnostic — COLMAP provides weak anchor while reproj is disabled
     loss_type: "l1"
 
   depth:
@@ -189,7 +186,7 @@ loss:
     weight: 1.0
 
   reproj:
-    weight: 2.0   # Strong — GT AE plane tracks are the main joint depth+pose signal
+    weight: 0.0   # Disabled for diagnostic — testing stability without reproj
 
 
 optim:
