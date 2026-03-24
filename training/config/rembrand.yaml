@@ -28,7 +28,7 @@ data:
       fix_img_num: -1
       fix_aspect_ratio: 1.0
       load_track: True
-      track_num: 1024        # Reduced from 3654 to avoid OOM in tracker correlation (B*S*N*H*W matmul)
+      track_num: 256         # Reduced from 3654 to avoid OOM in tracker correlation (B*S*N*H*W matmul)
       use_gt_tracks: True    # Use pre-computed AE tracks (tracks.npy / track_masks.npy)
       use_depth_tracks: False
       training: True
@@ -77,7 +77,7 @@ data:
       fix_img_num: -1
       fix_aspect_ratio: 1.0
       load_track: True
-      track_num: 1024
+      track_num: 256
       use_gt_tracks: True
       use_depth_tracks: False
       training: False
