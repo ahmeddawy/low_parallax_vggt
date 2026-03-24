@@ -109,7 +109,7 @@ data:
 
 
 logging:
-  log_dir: logs/${exp_name}
+  log_dir: /mnt/bucket/dawy/law_parallax_vggt_exp1/${exp_name}
   log_visuals: False
   log_freq: 1
   log_level_primary: DEBUG
@@ -152,7 +152,7 @@ logging:
 
 
 checkpoint:
-  save_dir: logs/${exp_name}/ckpts
+  save_dir: /mnt/bucket/dawy/law_parallax_vggt_exp1/${exp_name}/ckpts
   save_freq: 5
   # Weights are loaded inside _setup_lora() before PEFT wrapping — do NOT also load here.
   resume_checkpoint_path: null
