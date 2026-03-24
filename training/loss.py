@@ -892,10 +892,26 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
         align_corners=True,
     )  # B, 1, 1, N
     sampled_depth = sampled_depth.squeeze(1).squeeze(1)   # B, N
+    # Clamp depth to valid range — prevents Inf intermediate values in the
+    # unproject pipeline whose backward would give Inf*0=NaN (IEEE 754),
+    # corrupting aggregator/depth-head weights even when forward is sanitised.
+    sampled_depth = sampled_depth.clamp(min=1e-3, max=1e3)
 
     # --- Unproject frame-0 tracks to world 3D ---
-    K0     = pred_intrinsics[:, 0, :, :]   # B, 3, 3
-    K0_inv = torch.linalg.inv(K0)          # B, 3, 3
+    K0 = pred_intrinsics[:, 0, :, :]   # B, 3, 3
+    # Analytical K^{-1} for upper-triangular intrinsic matrix.
+    # Avoids linalg.inv whose backward = -K^{-T} @ g @ K^{-T}, which explodes
+    # when fx/fy is small (near-singular K) and corrupts the aggregator grads.
+    fx0 = K0[:, 0, 0].clamp(min=1e-2)
+    fy0 = K0[:, 1, 1].clamp(min=1e-2)
+    cx0 = K0[:, 0, 2]
+    cy0 = K0[:, 1, 2]
+    K0_inv = torch.zeros_like(K0)
+    K0_inv[:, 0, 0] =  1.0 / fx0
+    K0_inv[:, 1, 1] =  1.0 / fy0
+    K0_inv[:, 0, 2] = -cx0 / fx0
+    K0_inv[:, 1, 2] = -cy0 / fy0
+    K0_inv[:, 2, 2] =  1.0
 
     ones  = torch.ones_like(track0[..., :1])
     uvh   = torch.cat([track0, ones], dim=-1)           # B, N, 3
