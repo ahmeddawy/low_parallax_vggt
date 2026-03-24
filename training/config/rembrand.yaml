@@ -1,9 +1,11 @@
-exp_name: rembrand_lora_r16_reproj_masked_depth_v2
+exp_name: rembrand_lora_r16_reproj_masked_depth_v3
 # Experiment: LoRA fine-tuning (r=16) of VGGT aggregator on 83 outdoor fixed/low-parallax sequences.
 # Supervision: ViPE masked depth (plane+dynamic zeroed) + reprojection loss from AE GT plane tracks
 #              + direct track head supervision + weak COLMAP camera loss.
 # Pretrained depth+camera heads; fresh track head (not in base VGGT ckpt).
 # v2: depth weight 0.5, depth clip 0.5, track_num 256, invalid_conf_weight 0.0, NaN batch skip.
+# v3: gradient_loss_fn disabled ("none") — "grad" was spiking at plane-mask boundaries (loss_grad_depth→4+, Grad/depth 200-314 pre-clip, NaN reproj).
+#     alpha raised to 0.5 (conf_eq = 2.5 > expp1 minimum 1.0 → prevents conf collapse).
 img_size: 518         # 1920×1080 → 518×291 at 16:9 (scale ≈0.27×). 1 model-px ≈ 3.7 original-px → ~4px precision floor.
 num_workers: 8
 seed_value: 42
@@ -169,8 +171,9 @@ loss:
 
   depth:
     weight: 0.5                # Reduced from 1.0 — depth grad loss was exploding (norm 388 pre-clip), causing NaN reprojection
-    gradient_loss_fn: "grad"
+    gradient_loss_fn: "none"       # Disabled: "grad" spikes at plane-mask boundaries (valid→0 transitions), causing loss_grad_depth→4+ and NaN reproj
     valid_range: 0.95          # More aggressive outlier filtering — pseudo GT depth (ViPE) has more noise than LiDAR
+    alpha: 0.5                 # Raised from 0.2 — conf_eq = alpha/loss_reg; at loss_reg≈0.2, alpha=0.2 → conf_eq=1.0 (expp1 min) → collapse. alpha=0.5 → conf_eq=2.5 > 1.0
     invalid_conf_weight: 0.0    # Disabled: was collapsing conf→1.0 everywhere (outdoor seqs have sparse valid depth)
     invalid_conf_target: 1.0    # expp1 activation minimum = 1.0
     invalid_conf_loss_type: "l2"
