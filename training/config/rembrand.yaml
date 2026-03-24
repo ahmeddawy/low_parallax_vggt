@@ -1,13 +1,12 @@
-exp_name: rembrand_lora_r16_no_reproj_diag
-# Diagnostic experiment: reproj disabled to isolate whether instability originates from reproj loss.
-# Supervision: ViPE masked depth + COLMAP camera + direct track head supervision. No reproj loss.
-# If training is stable here, reproj loss is the instability source.
+exp_name: rembrand_lora_r16_no_reproj_v1
+# No reproj loss. Confirmed instability source: both masked_depth and regular_depth hit identical
+# NaN crash pattern (loss_reg inf/nan at step ~23, triggered by reproj spike) — masked_depth at E3, regular_depth at E4.
+# Supervision: ViPE masked depth + COLMAP camera (weight=0.5) + GT track head supervision.
 # v2: depth weight 0.5, depth clip 0.5, track_num 256, invalid_conf_weight 0.0, NaN batch skip.
-# v3: gradient_loss_fn disabled ("none") — "grad" was spiking at plane-mask boundaries.
+# v3: gradient_loss_fn disabled ("none") — "grad" spikes at plane-mask boundaries.
 # v4: reproj NaN gradient fix (sampled_depth clamp + analytical K^{-1}).
 # v5: alpha raised 0.5→1.0, camera grad clip tightened 1.0→0.5.
-# v6: camera.weight set to 0.0 (COLMAP unreliable).
-# diag: reproj.weight set to 0.0 — isolate standard losses (depth + camera + track).
+# v6: camera.weight set to 0.0 (COLMAP unreliable) — reverted to 0.5 since reproj is now disabled.
 img_size: 518         # 1920×1080 → 518×291 at 16:9 (scale ≈0.27×). 1 model-px ≈ 3.7 original-px → ~4px precision floor.
 num_workers: 8
 seed_value: 42
