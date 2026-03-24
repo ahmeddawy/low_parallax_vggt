@@ -345,6 +345,9 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 
     pred_depth      = predictions['depth']
     pred_depth_conf = predictions['depth_conf']
+    # Clamp predicted depth before loss — prevents diff.pow(2) overflow to Inf in bfloat16
+    # when the depth head outputs extreme values early in training.
+    pred_depth = pred_depth.clamp(min=1e-3, max=1e3)
 
     gt_depth      = batch['depths']
     gt_depth      = check_and_fix_inf_nan(gt_depth, "gt_depth")
