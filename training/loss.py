@@ -407,8 +407,12 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
     """
     bb, ss, hh, ww, nc = pred.shape
 
-    # Compute L2 distance between predicted and ground truth points
-    loss_reg = torch.norm(gt[mask] - pred[mask], dim=-1)
+    # Compute L2 distance between predicted and ground truth points.
+    # Use sqrt(sum_sq + eps) instead of torch.norm to avoid 0/0=NaN in backward:
+    # when bfloat16 rounds pred==gt exactly, norm(0)=0 and grad=0/0=NaN.
+    # eps=1e-8 keeps gradient finite: d/d(diff) = diff / sqrt(sum_sq + eps) → 0 when diff→0.
+    diff = gt[mask] - pred[mask]
+    loss_reg = (diff.pow(2).sum(-1) + 1e-8).sqrt()
     loss_reg = check_and_fix_inf_nan(loss_reg, "loss_reg")
 
     # Confidence-weighted loss: gamma * loss * conf - alpha * log(conf)
