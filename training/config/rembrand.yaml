@@ -28,7 +28,7 @@ data:
       fix_img_num: -1
       fix_aspect_ratio: 1.0
       load_track: True
-      track_num: 3654        # All AE plane tracks (~5px grid in original 1920×1080)
+      track_num: 1024        # Reduced from 3654 to avoid OOM in tracker correlation (B*S*N*H*W matmul)
       use_gt_tracks: True    # Use pre-computed AE tracks (tracks.npy / track_masks.npy)
       use_depth_tracks: False
       training: True
@@ -77,7 +77,7 @@ data:
       fix_img_num: -1
       fix_aspect_ratio: 1.0
       load_track: True
-      track_num: 3654
+      track_num: 1024
       use_gt_tracks: True
       use_depth_tracks: False
       training: False
@@ -170,7 +170,7 @@ loss:
     weight: 1.0
     gradient_loss_fn: "grad"
     valid_range: 0.95          # More aggressive outlier filtering — pseudo GT depth (ViPE) has more noise than LiDAR
-    invalid_conf_weight: 0.05   # Push conf → 1.0 (minimum) at dynamic-object pixels
+    invalid_conf_weight: 0.0    # Disabled: was collapsing conf→1.0 everywhere (outdoor seqs have sparse valid depth)
     invalid_conf_target: 1.0    # expp1 activation minimum = 1.0
     invalid_conf_loss_type: "l2"
 

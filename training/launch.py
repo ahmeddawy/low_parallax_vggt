@@ -5,9 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import os
 from hydra import initialize, compose
 from omegaconf import DictConfig, OmegaConf
 from trainer import Trainer
+
+# Reduce GPU memory fragmentation — prevents OOM on large correlation matmuls
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def main():
