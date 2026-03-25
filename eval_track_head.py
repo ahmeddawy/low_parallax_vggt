@@ -19,9 +19,9 @@ Metrics (reported in original image resolution):
   - vis_acc:   visibility prediction accuracy vs GT track_masks
 
 Visualization (--vis-max-seqs, default 3 per split):
-  - One image per sequence saved to --vis-dir/{split}/{seq}.jpg
-  - Columns = sampled frames; dots: GT=green, vanilla=red, finetuned=blue
-  - Legend strip appended at bottom
+  - One video per sequence saved to --vis-dir/{split}/{seq}.mp4
+  - Left panel: vanilla vs GT | Right panel: finetuned vs GT
+  - Dots: GT=green filled, prediction=colored outline
 
 Usage:
     python eval_track_head.py \\
@@ -31,7 +31,7 @@ Usage:
         --train-split-file /mnt/bucket/.../train_split.txt \\
         --val-split-file   /mnt/bucket/.../val_split.txt \\
         [--train-max-seqs 20] \\
-        [--vis-max-seqs 3] [--vis-n-tracks 50] [--vis-dir track_eval_viz] \\
+        [--vis-max-seqs 3] [--vis-n-tracks 50] [--vis-fps 8] [--vis-dir track_eval_viz] \\
         [--lora] [--lora-r 16] [--lora-alpha 32] \\
         [--track-chunk 256] \\
         [--output-json track_eval_results.json]
@@ -45,7 +45,7 @@ import random
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -111,8 +111,8 @@ def parse_args():
         help="Number of tracks to draw per frame",
     )
     p.add_argument(
-        "--vis-n-frames", type=int, default=6,
-        help="Number of frames to show per sequence strip",
+        "--vis-fps", type=int, default=8,
+        help="Frame rate of output videos (default: 8)",
     )
     p.add_argument(
         "--vis-dir", default="track_eval_viz",
@@ -376,46 +376,119 @@ def _draw_dot(draw, x, y, r, color, filled=True):
         draw.ellipse(box, outline=color, width=2)
 
 
-def _make_legend(width, font):
-    """Return a small PIL image with the color legend."""
-    h = 22
-    img = Image.new("RGB", (width, h), _LEGEND_BG)
-    draw = ImageDraw.Draw(img)
-    items = [
-        (_GT_COLOR,  True,  "GT (green)"),
-        (_VAN_COLOR, False, "Vanilla (red)"),
-        (_FT_COLOR,  False, "Finetuned (blue)"),
-    ]
-    x = 6
-    for color, filled, label in items:
-        _draw_dot(draw, x + 5, h // 2, 5, color, filled=filled)
-        draw.text((x + 14, 4), label, fill=(220, 220, 220), font=font)
-        x += 140
-    return img
+def _render_frame(image_path, fi, gt_tracks_orig, gt_vis_mask,
+                  preds_by_tag, sampled_ids, sx, sy, W_disp, H_disp):
+    """
+    Render one video frame as a numpy uint8 RGB array (H, W, 3).
+
+    Left half  = vanilla prediction vs GT
+    Right half = finetuned prediction vs GT
+    Dots: GT=green filled, prediction=colored outline.
+    A thin divider and panel labels are drawn in the center.
+    """
+    import cv2
+
+    def load_bg(path):
+        img = Image.open(path).convert("RGB")
+        img = img.resize((W_disp, H_disp), Image.BILINEAR)
+        return np.array(img)
+
+    bg = load_bg(image_path)
+    left = bg.copy()
+    right = bg.copy()
+
+    dot_r_gt = 4
+    dot_r_pred = 4
+
+    for tid in sampled_ids:
+        # GT position (same for both panels)
+        if gt_vis_mask[fi, tid]:
+            gx = int(round(float(gt_tracks_orig[fi, tid, 0]) * sx))
+            gy = int(round(float(gt_tracks_orig[fi, tid, 1]) * sy))
+            cv2.circle(left,  (gx, gy), dot_r_gt, _GT_COLOR[::-1], -1)
+            cv2.circle(right, (gx, gy), dot_r_gt, _GT_COLOR[::-1], -1)
+
+        # Vanilla (left panel)
+        if "vanilla" in preds_by_tag:
+            van_tracks, _ = preds_by_tag["vanilla"]
+            vx = int(round(float(van_tracks[fi, tid, 0]) * sx))
+            vy = int(round(float(van_tracks[fi, tid, 1]) * sy))
+            cv2.circle(left, (vx, vy), dot_r_pred, _VAN_COLOR[::-1], 2)
+
+        # Finetuned (right panel)
+        if "finetuned" in preds_by_tag:
+            ft_tracks, _ = preds_by_tag["finetuned"]
+            fx = int(round(float(ft_tracks[fi, tid, 0]) * sx))
+            fy = int(round(float(ft_tracks[fi, tid, 1]) * sy))
+            cv2.circle(right, (fx, fy), dot_r_pred, _FT_COLOR[::-1], 2)
+
+    # Panel labels (top-left corner of each panel)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(left,  "Vanilla",   (8, 22), font, 0.7,
+                _VAN_COLOR[::-1], 2, cv2.LINE_AA)
+    cv2.putText(right, "Finetuned", (8, 22), font, 0.7,
+                _FT_COLOR[::-1],  2, cv2.LINE_AA)
+
+    # Frame index label
+    label = f"frame {fi}"
+    cv2.putText(left,  label, (8, H_disp - 8), font, 0.5,
+                (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(right, label, (8, H_disp - 8), font, 0.5,
+                (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Legend bar at bottom of each panel
+    bar_h = 20
+    for panel in (left, right):
+        panel[-bar_h:] = (20, 20, 20)
+    cv2.circle(left[-bar_h:],  (10, bar_h // 2), 5,
+               _GT_COLOR[::-1],  -1)
+    cv2.putText(left[-bar_h:], "GT", (18, bar_h - 5),
+                font, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.circle(left[-bar_h:],  (50, bar_h // 2), 5,
+               _VAN_COLOR[::-1], 2)
+    cv2.putText(left[-bar_h:], "Pred", (58, bar_h - 5),
+                font, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.circle(right[-bar_h:], (10, bar_h // 2), 5,
+               _GT_COLOR[::-1],  -1)
+    cv2.putText(right[-bar_h:], "GT", (18, bar_h - 5),
+                font, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.circle(right[-bar_h:], (50, bar_h // 2), 5,
+               _FT_COLOR[::-1],  2)
+    cv2.putText(right[-bar_h:], "Pred", (58, bar_h - 5),
+                font, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+
+    # Divider between panels
+    divider = np.full((H_disp, 3, 3), 180, dtype=np.uint8)
+    frame = np.concatenate([left, divider, right], axis=1)
+    return frame
 
 
 def visualize_sequence(
     seq_name, image_paths, gt_tracks_orig, gt_vis_mask,
-    preds_by_tag, split_name, vis_dir, n_tracks, n_frames,
+    preds_by_tag, split_name, vis_dir, n_tracks, fps=8,
 ):
     """
-    Save a frame-strip visualization for one sequence.
+    Save a side-by-side comparison video for one sequence.
+
+    Left panel:  vanilla prediction vs GT
+    Right panel: finetuned prediction vs GT
+    GT = green filled dot, prediction = colored outline circle.
 
     preds_by_tag: dict  tag -> (pred_tracks_orig, pred_vis)
-                  Expected tags: "vanilla", "finetuned" (either may be absent)
-    Layout: columns = sampled frames (1..S-1)
-            dots:  GT=green filled, vanilla=red outline, finetuned=blue outline
+    fps: output video frame rate
     """
+    try:
+        import cv2
+    except ImportError:
+        print("    [viz] SKIP — opencv-python not installed (pip install opencv-python)")
+        return
+
     S = len(image_paths)
     if S < 2:
         return
 
-    # Sample frames evenly from 1..S-1
-    n_show = min(n_frames, S - 1)
-    frame_ids = np.linspace(1, S - 1, n_show, dtype=int)
-
     # Sample tracks visible in frame 1
-    gt_vis_f1 = gt_vis_mask[1] if S > 1 else gt_vis_mask[0]
+    gt_vis_f1 = gt_vis_mask[1]
     valid_ids = np.where(gt_vis_f1)[0]
     if len(valid_ids) == 0:
         return
@@ -424,64 +497,33 @@ def visualize_sequence(
         valid_ids, size=min(n_tracks, len(valid_ids)), replace=False
     )
 
-    # Load images and resize to display resolution
     W_orig, H_orig, W_disp, H_disp = get_model_resolution(image_paths[0])
     sx = W_disp / W_orig
     sy = H_disp / H_orig
 
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
-
-    dot_r_gt = 4    # GT: slightly larger filled dot
-    dot_r_pred = 4  # predictions: outline circle same size
-
-    cell_w, cell_h = W_disp, H_disp
-    n_cols = len(frame_ids)
-
-    legend = _make_legend(cell_w * n_cols, font)
-    canvas = Image.new(
-        "RGB", (cell_w * n_cols, cell_h + legend.height), _LEGEND_BG
-    )
-    canvas.paste(legend, (0, cell_h))
-
-    for col, fi in enumerate(frame_ids):
-        frame_img = Image.open(image_paths[fi]).convert("RGB")
-        frame_img = frame_img.resize((W_disp, H_disp), Image.BILINEAR)
-        draw = ImageDraw.Draw(frame_img)
-
-        for tid in sampled_ids:
-            # --- GT dot ---
-            if gt_vis_mask[fi, tid]:
-                gx = float(gt_tracks_orig[fi, tid, 0]) * sx
-                gy = float(gt_tracks_orig[fi, tid, 1]) * sy
-                _draw_dot(draw, gx, gy, dot_r_gt, _GT_COLOR, filled=True)
-
-            # --- Vanilla prediction ---
-            if "vanilla" in preds_by_tag:
-                van_tracks, _ = preds_by_tag["vanilla"]
-                vx = float(van_tracks[fi, tid, 0]) * sx
-                vy = float(van_tracks[fi, tid, 1]) * sy
-                _draw_dot(draw, vx, vy, dot_r_pred, _VAN_COLOR, filled=False)
-
-            # --- Finetuned prediction ---
-            if "finetuned" in preds_by_tag:
-                ft_tracks, _ = preds_by_tag["finetuned"]
-                fx = float(ft_tracks[fi, tid, 0]) * sx
-                fy = float(ft_tracks[fi, tid, 1]) * sy
-                _draw_dot(draw, fx, fy, dot_r_pred, _FT_COLOR, filled=False)
-
-        # Frame label
-        draw.text((4, 3), f"frame {fi}", fill=(255, 255, 255), font=font)
-
-        canvas.paste(frame_img, (col * cell_w, 0))
+    # Video width: two panels side-by-side + 3px divider
+    vid_w = W_disp * 2 + 3
+    vid_h = H_disp
 
     out_dir = os.path.join(vis_dir, split_name)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{seq_name}.jpg")
-    canvas.save(out_path, quality=92)
-    print(f"    [viz] -> {out_path}")
+    out_path = os.path.join(out_dir, f"{seq_name}.mp4")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (vid_w, vid_h))
+
+    for fi in range(S):
+        frame_rgb = _render_frame(
+            image_paths[fi], fi,
+            gt_tracks_orig, gt_vis_mask,
+            preds_by_tag, sampled_ids,
+            sx, sy, W_disp, H_disp,
+        )
+        # cv2 expects BGR
+        writer.write(frame_rgb[:, :, ::-1])
+
+    writer.release()
+    print(f"    [viz] -> {out_path}  ({S} frames @ {fps}fps)")
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +548,7 @@ def mean_over_seqs(seq_results):
 def eval_split(
     split_name, sequences, dataset_dir, models,
     chunk_size, vis_thresh, device, dtype,
-    vis_max_seqs=3, vis_n_tracks=50, vis_n_frames=6, vis_dir="track_eval_viz",
+    vis_max_seqs=3, vis_n_tracks=50, vis_fps=8, vis_dir="track_eval_viz",
 ):
     """
     Evaluate all sequences in one split for every model in `models`.
@@ -591,7 +633,7 @@ def eval_split(
                 seq, image_paths,
                 gt_tracks_orig, gt_vis_mask,
                 preds_by_tag, split_name, vis_dir,
-                n_tracks=vis_n_tracks, n_frames=vis_n_frames,
+                n_tracks=vis_n_tracks, fps=vis_fps,
             )
             viz_count += 1
 
@@ -692,7 +734,7 @@ def main():
             args.track_chunk, args.vis_thresh, device, dtype,
             vis_max_seqs=args.vis_max_seqs,
             vis_n_tracks=args.vis_n_tracks,
-            vis_n_frames=args.vis_n_frames,
+            vis_fps=args.vis_fps,
             vis_dir=args.vis_dir,
         )
 
