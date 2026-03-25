@@ -18,6 +18,11 @@ Metrics (reported in original image resolution):
   - delta_Npx: fraction of predictions within N pixels of GT (1,2,5,10)
   - vis_acc:   visibility prediction accuracy vs GT track_masks
 
+Visualization (--vis-max-seqs, default 3 per split):
+  - One image per sequence saved to --vis-dir/{split}/{seq}.jpg
+  - Columns = sampled frames; dots: GT=green, vanilla=red, finetuned=blue
+  - Legend strip appended at bottom
+
 Usage:
     python eval_track_head.py \\
         --vanilla-ckpt     /workspace/model.pt \\
@@ -26,6 +31,7 @@ Usage:
         --train-split-file /mnt/bucket/.../train_split.txt \\
         --val-split-file   /mnt/bucket/.../val_split.txt \\
         [--train-max-seqs 20] \\
+        [--vis-max-seqs 3] [--vis-n-tracks 50] [--vis-dir track_eval_viz] \\
         [--lora] [--lora-r 16] [--lora-alpha 32] \\
         [--track-chunk 256] \\
         [--output-json track_eval_results.json]
@@ -39,7 +45,7 @@ import random
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -94,6 +100,23 @@ def parse_args():
     p.add_argument(
         "--vis-thresh", type=float, default=0.5,
         help="Threshold on predicted vis score to call a point visible",
+    )
+    # Visualization
+    p.add_argument(
+        "--vis-max-seqs", type=int, default=3,
+        help="Visualize first N sequences per split (0 = disabled)",
+    )
+    p.add_argument(
+        "--vis-n-tracks", type=int, default=50,
+        help="Number of tracks to draw per frame",
+    )
+    p.add_argument(
+        "--vis-n-frames", type=int, default=6,
+        help="Number of frames to show per sequence strip",
+    )
+    p.add_argument(
+        "--vis-dir", default="track_eval_viz",
+        help="Output directory for visualization images",
     )
     p.add_argument("--output-json", default="track_eval_results.json")
     return p.parse_args()
@@ -227,12 +250,12 @@ def compute_metrics(
     gt_vis_mask:      (S, N) bool
     pred_vis:         (S, N) float
 
-    Frame 0 is the query frame and is skipped from error computation.
+    Frame 0 is the query frame and is skipped.
     Returns dict or None if no visible GT points in frames 1..S.
     """
-    gt_t = gt_tracks_orig[1:]    # (S-1, N, 2)
+    gt_t = gt_tracks_orig[1:]
     pred_t = pred_tracks_orig[1:]
-    gt_mask = gt_vis_mask[1:]    # (S-1, N) bool
+    gt_mask = gt_vis_mask[1:]
     pred_v = pred_vis[1:]
 
     diff = pred_t - gt_t
@@ -260,25 +283,30 @@ def compute_metrics(
 
 
 # ---------------------------------------------------------------------------
-# Per-sequence evaluation
+# Per-sequence evaluation  (returns raw predictions for optional viz)
 # ---------------------------------------------------------------------------
 
 def eval_sequence(
     seq_name, dataset_dir, model, chunk_size, vis_thresh, device, dtype
 ):
+    """
+    Returns: (metrics, error, preds)
+      metrics: dict or None
+      error:   str or None
+      preds:   (pred_tracks_orig, pred_vis) in original pixel space, or None
+    """
     seq_dir = os.path.join(dataset_dir, seq_name)
     image_dir = os.path.join(seq_dir, "images")
 
     image_paths = sorted(glob.glob(os.path.join(image_dir, "*")))
     if not image_paths:
-        return None, f"no images in {image_dir}"
+        return None, f"no images in {image_dir}", None
 
     tracks_path = os.path.join(seq_dir, "tracks.npy")
     masks_path = os.path.join(seq_dir, "track_masks.npy")
     if not os.path.isfile(tracks_path):
-        return None, "no tracks.npy"
+        return None, "no tracks.npy", None
 
-    # GT tracks in original pixel space: (N_frames_total, N_tracks, 2)
     gt_tracks_orig = np.load(tracks_path).astype(np.float32)
     if os.path.isfile(masks_path):
         gt_vis_mask = np.load(masks_path).astype(bool)
@@ -290,24 +318,20 @@ def eval_sequence(
         return None, (
             f"tracks.npy has {gt_tracks_orig.shape[0]} frames "
             f"but {S} images found"
-        )
+        ), None
 
     gt_tracks_orig = gt_tracks_orig[:S]
     gt_vis_mask = gt_vis_mask[:S]
 
     if S < 2:
-        return None, "need at least 2 frames"
+        return None, "need at least 2 frames", None
 
     W_orig, H_orig, W_model, H_model = get_model_resolution(image_paths[0])
     scale_x = W_model / W_orig
     scale_y = H_model / H_orig
 
-    # Load images at model resolution (16:9 crop)
-    images_tensor = load_and_preprocess_images(
-        image_paths, mode="crop"
-    )  # (S, 3, H_model, W_model)
+    images_tensor = load_and_preprocess_images(image_paths, mode="crop")
 
-    # Frame-0 GT positions scaled to model space as query points
     q_orig = gt_tracks_orig[0].copy()  # (N, 2)
     q_model = np.stack(
         [q_orig[:, 0] * scale_x, q_orig[:, 1] * scale_y], axis=-1
@@ -318,18 +342,146 @@ def eval_sequence(
             model, images_tensor, q_model, chunk_size, device, dtype
         )
     except RuntimeError as exc:
-        return None, f"runtime error: {exc}"
+        return None, f"runtime error: {exc}", None
 
     # Scale predictions back to original space
     pred_orig = np.stack(
         [pred_model[:, :, 0] / scale_x, pred_model[:, :, 1] / scale_y],
         axis=-1,
-    )  # (S, N, 2)
+    )
 
     metrics = compute_metrics(
         pred_orig, gt_tracks_orig, gt_vis_mask, pred_vis, vis_thresh
     )
-    return metrics, None
+    return metrics, None, (pred_orig, pred_vis)
+
+
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+
+# Dot colors: (filled GT, outline vanilla, outline finetuned)
+_GT_COLOR = (0, 220, 0)
+_VAN_COLOR = (220, 60, 60)
+_FT_COLOR = (60, 130, 255)
+_LEGEND_BG = (20, 20, 20)
+
+
+def _draw_dot(draw, x, y, r, color, filled=True):
+    """Draw a circle; filled or outline only."""
+    box = [x - r, y - r, x + r, y + r]
+    if filled:
+        draw.ellipse(box, fill=color)
+    else:
+        draw.ellipse(box, outline=color, width=2)
+
+
+def _make_legend(width, font):
+    """Return a small PIL image with the color legend."""
+    h = 22
+    img = Image.new("RGB", (width, h), _LEGEND_BG)
+    draw = ImageDraw.Draw(img)
+    items = [
+        (_GT_COLOR,  True,  "GT (green)"),
+        (_VAN_COLOR, False, "Vanilla (red)"),
+        (_FT_COLOR,  False, "Finetuned (blue)"),
+    ]
+    x = 6
+    for color, filled, label in items:
+        _draw_dot(draw, x + 5, h // 2, 5, color, filled=filled)
+        draw.text((x + 14, 4), label, fill=(220, 220, 220), font=font)
+        x += 140
+    return img
+
+
+def visualize_sequence(
+    seq_name, image_paths, gt_tracks_orig, gt_vis_mask,
+    preds_by_tag, split_name, vis_dir, n_tracks, n_frames,
+):
+    """
+    Save a frame-strip visualization for one sequence.
+
+    preds_by_tag: dict  tag -> (pred_tracks_orig, pred_vis)
+                  Expected tags: "vanilla", "finetuned" (either may be absent)
+    Layout: columns = sampled frames (1..S-1)
+            dots:  GT=green filled, vanilla=red outline, finetuned=blue outline
+    """
+    S = len(image_paths)
+    if S < 2:
+        return
+
+    # Sample frames evenly from 1..S-1
+    n_show = min(n_frames, S - 1)
+    frame_ids = np.linspace(1, S - 1, n_show, dtype=int)
+
+    # Sample tracks visible in frame 1
+    gt_vis_f1 = gt_vis_mask[1] if S > 1 else gt_vis_mask[0]
+    valid_ids = np.where(gt_vis_f1)[0]
+    if len(valid_ids) == 0:
+        return
+    rng = np.random.RandomState(42)
+    sampled_ids = rng.choice(
+        valid_ids, size=min(n_tracks, len(valid_ids)), replace=False
+    )
+
+    # Load images and resize to display resolution
+    W_orig, H_orig, W_disp, H_disp = get_model_resolution(image_paths[0])
+    sx = W_disp / W_orig
+    sy = H_disp / H_orig
+
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    dot_r_gt = 4    # GT: slightly larger filled dot
+    dot_r_pred = 4  # predictions: outline circle same size
+
+    cell_w, cell_h = W_disp, H_disp
+    n_cols = len(frame_ids)
+
+    legend = _make_legend(cell_w * n_cols, font)
+    canvas = Image.new(
+        "RGB", (cell_w * n_cols, cell_h + legend.height), _LEGEND_BG
+    )
+    canvas.paste(legend, (0, cell_h))
+
+    for col, fi in enumerate(frame_ids):
+        frame_img = Image.open(image_paths[fi]).convert("RGB")
+        frame_img = frame_img.resize((W_disp, H_disp), Image.BILINEAR)
+        draw = ImageDraw.Draw(frame_img)
+
+        for tid in sampled_ids:
+            # --- GT dot ---
+            if gt_vis_mask[fi, tid]:
+                gx = float(gt_tracks_orig[fi, tid, 0]) * sx
+                gy = float(gt_tracks_orig[fi, tid, 1]) * sy
+                _draw_dot(draw, gx, gy, dot_r_gt, _GT_COLOR, filled=True)
+
+            # --- Vanilla prediction ---
+            if "vanilla" in preds_by_tag:
+                van_tracks, _ = preds_by_tag["vanilla"]
+                vx = float(van_tracks[fi, tid, 0]) * sx
+                vy = float(van_tracks[fi, tid, 1]) * sy
+                _draw_dot(draw, vx, vy, dot_r_pred, _VAN_COLOR, filled=False)
+
+            # --- Finetuned prediction ---
+            if "finetuned" in preds_by_tag:
+                ft_tracks, _ = preds_by_tag["finetuned"]
+                fx = float(ft_tracks[fi, tid, 0]) * sx
+                fy = float(ft_tracks[fi, tid, 1]) * sy
+                _draw_dot(draw, fx, fy, dot_r_pred, _FT_COLOR, filled=False)
+
+        # Frame label
+        draw.text((4, 3), f"frame {fi}", fill=(255, 255, 255), font=font)
+
+        canvas.paste(frame_img, (col * cell_w, 0))
+
+    out_dir = os.path.join(vis_dir, split_name)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{seq_name}.jpg")
+    canvas.save(out_path, quality=92)
+    print(f"    [viz] -> {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -354,24 +506,59 @@ def mean_over_seqs(seq_results):
 def eval_split(
     split_name, sequences, dataset_dir, models,
     chunk_size, vis_thresh, device, dtype,
+    vis_max_seqs=3, vis_n_tracks=50, vis_n_frames=6, vis_dir="track_eval_viz",
 ):
     """
     Evaluate all sequences in one split for every model in `models`.
 
-    models: dict of tag -> model
-    Returns: dict  (includes per-seq results and '<tag>_mean' aggregates)
+    Loops sequence-first so predictions from all models are available
+    together for visualization before moving to the next sequence.
+
+    models: dict  tag -> model
+    Returns: dict  (per-seq results + '<tag>_mean' aggregates)
     """
     results = {tag: {} for tag in models}
-
     sep = "=" * 70
+
     print(f"\n{sep}")
     print(f"SPLIT: {split_name.upper()} ({len(sequences)} sequences)")
     print(sep)
 
+    viz_count = 0
+
     for seq in sequences:
         print(f"\n  [{seq}]")
+
+        seq_dir = os.path.join(dataset_dir, seq)
+        image_paths = sorted(
+            glob.glob(os.path.join(seq_dir, "images", "*"))
+        )
+        tracks_path = os.path.join(seq_dir, "tracks.npy")
+        masks_path = os.path.join(seq_dir, "track_masks.npy")
+
+        # Load GT once, shared across all models
+        if (
+            image_paths
+            and os.path.isfile(tracks_path)
+        ):
+            gt_tracks_orig = np.load(tracks_path).astype(np.float32)
+            if os.path.isfile(masks_path):
+                gt_vis_mask = np.load(masks_path).astype(bool)
+            else:
+                gt_vis_mask = np.ones(
+                    gt_tracks_orig.shape[:2], dtype=bool
+                )
+            S = len(image_paths)
+            gt_tracks_orig = gt_tracks_orig[:S]
+            gt_vis_mask = gt_vis_mask[:S]
+        else:
+            gt_tracks_orig = None
+            gt_vis_mask = None
+
+        preds_by_tag = {}
+
         for tag, model in models.items():
-            metrics, err = eval_sequence(
+            metrics, err, preds = eval_sequence(
                 seq, dataset_dir, model,
                 chunk_size, vis_thresh, device, dtype,
             )
@@ -379,6 +566,8 @@ def eval_split(
                 print(f"    {tag:10s}  SKIP ({err})")
                 continue
             results[tag][seq] = metrics
+            if preds is not None:
+                preds_by_tag[tag] = preds
             print(
                 f"    {tag:10s}  "
                 f"ATE={metrics['ate']:6.2f}px  "
@@ -390,7 +579,23 @@ def eval_split(
                 f"N={metrics['n_points']}"
             )
 
-    # Aggregate stats + vanilla vs finetuned comparison
+        # Visualization for first vis_max_seqs sequences in this split
+        if (
+            vis_max_seqs > 0
+            and viz_count < vis_max_seqs
+            and preds_by_tag
+            and gt_tracks_orig is not None
+            and image_paths
+        ):
+            visualize_sequence(
+                seq, image_paths,
+                gt_tracks_orig, gt_vis_mask,
+                preds_by_tag, split_name, vis_dir,
+                n_tracks=vis_n_tracks, n_frames=vis_n_frames,
+            )
+            viz_count += 1
+
+    # Aggregate stats + comparison
     print(f"\n  --- {split_name.upper()} aggregate ---")
     agg_by_tag = {}
     for tag in models:
@@ -417,7 +622,7 @@ def eval_split(
         ate_d = ft["ate"] - v["ate"]
         d5_d = ft["delta_5px"] - v["delta_5px"]
         pct = ate_d / v["ate"] * 100
-        print(f"\n  IMPROVEMENT vanilla -> finetuned:")
+        print("\n  IMPROVEMENT vanilla -> finetuned:")
         print(
             f"    ATE:     {v['ate']:.2f} -> {ft['ate']:.2f} px  "
             f"({ate_d:+.2f}px, {pct:+.1f}%)"
@@ -449,14 +654,20 @@ def main():
     val_seqs = load_sequences(args.val_split_file)
 
     # Subsample train split
-    max_tr = args.train_max_seqs
     n_total = len(train_seqs)
+    max_tr = args.train_max_seqs
     if max_tr > 0 and n_total > max_tr:
         train_seqs = random.sample(train_seqs, max_tr)
         print(f"Train split: sampled {max_tr} / {n_total} sequences")
     else:
         print(f"Train split: {n_total} sequences")
     print(f"Val   split: {len(val_seqs)} sequences")
+
+    if args.vis_max_seqs > 0:
+        print(
+            f"Visualization: first {args.vis_max_seqs} seqs per split "
+            f"-> {args.vis_dir}/"
+        )
 
     # Load models once — reused across both splits
     print(f"\nLoading vanilla model   : {args.vanilla_ckpt}")
@@ -479,6 +690,10 @@ def main():
         all_results[split_name] = eval_split(
             split_name, seqs, args.dataset_dir, models,
             args.track_chunk, args.vis_thresh, device, dtype,
+            vis_max_seqs=args.vis_max_seqs,
+            vis_n_tracks=args.vis_n_tracks,
+            vis_n_frames=args.vis_n_frames,
+            vis_dir=args.vis_dir,
         )
 
     # Cross-split summary table
@@ -488,8 +703,7 @@ def main():
     print(sep)
     for tag in ("vanilla", "finetuned"):
         for split_name in ("train", "val"):
-            key = f"{tag}_mean"
-            agg = all_results.get(split_name, {}).get(key)
+            agg = all_results.get(split_name, {}).get(f"{tag}_mean")
             if agg is None:
                 continue
             print(
