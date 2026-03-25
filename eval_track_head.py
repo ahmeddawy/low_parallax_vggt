@@ -457,8 +457,8 @@ def _render_frame(image_path, fi, gt_tracks_orig, gt_vis_mask,
     cv2.putText(right[-bar_h:], "Pred", (58, bar_h - 5),
                 font, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
 
-    # Divider between panels
-    divider = np.full((H_disp, 3, 3), 180, dtype=np.uint8)
+    # Divider between panels (2px wide — keeps total width even for H.264)
+    divider = np.full((H_disp, 2, 3), 180, dtype=np.uint8)
     frame = np.concatenate([left, divider, right], axis=1)
     return frame
 
@@ -501,8 +501,12 @@ def visualize_sequence(
     sx = W_disp / W_orig
     sy = H_disp / H_orig
 
-    # Video width: two panels side-by-side + 3px divider
-    vid_w = W_disp * 2 + 3
+    # H.264 (yuv420p) requires even width and height — round up if needed
+    W_disp = W_disp + (W_disp % 2)
+    H_disp = H_disp + (H_disp % 2)
+
+    # Video: two panels side-by-side + 2px divider (keeps total width even)
+    vid_w = W_disp * 2 + 2
     vid_h = H_disp
 
     out_dir = os.path.join(vis_dir, split_name)
@@ -542,7 +546,8 @@ def visualize_sequence(
             cmd, capture_output=True, text=True
         )
         if result.returncode != 0:
-            print(f"    [viz] ffmpeg failed: {result.stderr[-300:]}")
+            print(f"    [viz] ffmpeg failed (code {result.returncode}):")
+            print(result.stderr[-600:])
             return
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
