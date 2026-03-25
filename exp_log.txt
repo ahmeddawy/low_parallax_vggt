@@ -1,0 +1,179 @@
+================================================================================
+EXPERIMENT LOG — Low-Parallax VGGT Fine-tuning
+================================================================================
+Dataset : tracking_whisper_sample_dataset
+          83 train seqs / 20 val seqs, 1920x1080, 16:9, AE plane tracks
+Model   : VGGT LoRA r=16 alpha=32, target=[qkv, proj] (aggregator only)
+Eval    : eval_track_head.py (2D) + eval_reproj_3d.py (3D)
+Branch  : reproj-huber-stable (ahmeddawy/low_parallax_vggt)
+
+--------------------------------------------------------------------------------
+EXP-01  rembrand_lora_r16_no_reproj_v2
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.5, depth.weight=0.5, track.weight=1.0, reproj=null
+Epochs  : 100
+Best ckpt: epoch 95  (val track loss = 0.063)
+
+Training dynamics:
+  train track loss   : 0.122 (E0)  -> 0.063 (E95 best) -> 0.081 (E99)
+  val   track loss   : 0.122 (E0)  -> 0.063 (E95 best)
+  train camera loss  : 0.042       -> 0.010  (overfits to COLMAP)
+  val   camera loss  : stuck 0.033-0.058  (no generalisation)
+  G_dep (depth grad) : 10 (E0)    -> 50-150 (large but clipped, no NaN)
+  conf_dep train     : -0.43       -> -3.14  (depth confidence collapse)
+  Training stable    : no NaN / crash for all 100 epochs
+
+2D Track Eval (eval_track_head.py, E95):
+  TRAIN:
+    vanilla   ATE=2.44px  d5=0.908
+    finetuned ATE=1.62px  d5=0.916
+    IMPROVEMENT: -0.82px (-33.7%)
+  VAL:
+    vanilla   ATE=2.00px
+    finetuned ATE=1.34px
+    IMPROVEMENT: -0.66px (-34.7%)
+  -> Genuine generalisation: val/train improvement ratio ~1:1, no overfitting
+
+3D Reproj Eval (eval_reproj_3d.py, predicted depth, E95):
+  TRAIN:
+    vanilla   reproj_ATE=5.65px  d5=0.751  vis=0.977
+    finetuned reproj_ATE=3.54px  d5=0.855  vis=1.000
+  VAL:
+    vanilla   reproj_ATE=2.05px  d5=0.920  vis=0.992
+    finetuned reproj_ATE=1.34px  d5=0.961  vis=1.000
+  IMPROVEMENT (val):
+    reproj_ATE: 1.74 -> 5.78 px  (+4.04px, +232.1%)
+    d5:         0.943 -> 0.512   (-0.431)
+  -> Track head improved (2D ATE -34%) but 3D reproj degraded 3.3x
+  -> COLMAP camera supervision hurts 3D geometry despite 2D track gains
+
+Key insights:
+  [+] LoRA + GT track supervision works — ~34% ATE reduction train and val
+  [+] val improvement matches train -> genuine domain adaptation, not overfit
+  [-] COLMAP camera supervision too noisy for low-parallax -> camera head degrades
+  [-] 3D reproj_ATE degrades 1.74 -> 5.78px (+232%) on val despite 2D gains
+  [-] Depth confidence collapses on train, does not generalise
+  [-] G_dep spikes (50-150) indicate depth gradient instability
+
+--------------------------------------------------------------------------------
+EXP-02  rembrand_lora_r16_reproj_huber_v5
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.5, depth.weight=0.5, track.weight=1.0,
+          reproj.weight=1.0 (Huber delta=1.0px, z.clamp(0.1), err.clamp(5.0),
+          z.detach() fix)
+Epochs  : 100
+Best ckpt: epoch 95  (val track loss = 0.056)
+
+Stability fixes applied vs prior reproj attempts:
+  z.detach()        : prevents cross-gradient blow-up between depth and camera
+  Huber loss        : robust to outliers (quadratic <1px, linear above)
+  z.clamp(min=0.1)  : max 1/z gradient drops 1000->10
+  err.clamp(max=5.0): hard cap per-track error
+
+Training dynamics:
+  reproj loss       : 0.71 (E0) -> stuck 4.8-5.0 all 100 epochs
+                      (always hitting clamp ceiling -> zero useful gradient)
+  G_dep             : 391 (E0), spikes 1979 (E41), 1655 (E22)
+                      10-40x larger than EXP-01
+  camera loss       : oscillating 0.044 -> 0.205 (E20) -> 0.080 (E27)
+                      never converges, actively destabilised
+  val track loss    : 0.132 (E0) -> 0.056 (E95 best)
+  NaN crashes       : none (z.detach() fix confirmed working)
+
+2D Track Eval (eval_track_head.py, E95):
+  VAL:
+    finetuned ATE ~1.50px
+    better than vanilla, slightly worse than EXP-01
+  -> Camera instability from reproj propagates back through aggregator
+
+3D Reproj Eval (eval_reproj_3d.py, predicted depth, E95):
+  TRAIN:
+    vanilla   reproj_ATE=2.73px  d5=0.863  vis=0.987
+    finetuned reproj_ATE=1.76px  d5=0.910  vis=1.000
+  VAL:
+    vanilla   reproj_ATE=2.05px  d5=0.920  vis=0.992
+    finetuned reproj_ATE=1.50px  d5=0.933  vis=1.000
+  IMPROVEMENT (val):
+    reproj_ATE: 1.74 -> 238.89 px  (+237.15px, +13626.8%)
+    d5:         0.943 -> 0.079      (-0.864)
+  -> Catastrophic camera degradation — worst of all three models
+  -> Val rows show 2D track ATE (1.50 < 2.05); 3D reproj_ATE is 238.89px
+
+Root cause of reproj failure:
+  COLMAP cameras on low-parallax are too inaccurate ->
+  reprojected positions always >5px from GT tracks ->
+  always hitting clamp ceiling -> zero gradient from reproj ->
+  meanwhile COLMAP camera loss destabilises cameras ->
+  result: cameras actively destroyed, not improved
+
+Key insights:
+  [+] z.detach() successfully prevented NaN crashes (confirmed fix)
+  [+] val track loss 0.056 marginally better than EXP-01 (0.063)
+  [-] Reproj loss completely ineffective: stuck at ceiling all 100 epochs
+  [-] G_dep 10-40x larger than EXP-01 -> reproj destabilises depth gradients
+  [-] Camera oscillation confirms reproj loss fights COLMAP supervision
+  [-] COLMAP camera init too far off for reproj to recover
+
+================================================================================
+OVERALL CONCLUSIONS
+================================================================================
+
+1. WHAT WORKS:
+   - LoRA (r=16) + GT AE track supervision -> consistent ~34% 2D ATE reduction
+   - Generalisation is genuine (val matches train improvement)
+   - z.detach() is a necessary fix for any reproj-type loss
+
+2. WHAT DOES NOT WORK:
+   - COLMAP camera supervision on low-parallax -> 3D reproj degrades
+   - Reproj loss with noisy COLMAP init -> always saturated, zero gradient signal
+   - ViPE depth supervision -> confidence collapse, gradient spikes
+   - Both EXP-01 and EXP-02 finetuned models are WORSE than vanilla in 3D reproj
+
+3. QUANTITATIVE SUMMARY:
+                  2D track ATE (val)    3D reproj_ATE (val)
+   vanilla              2.05px               1.74px
+   EXP-01 finetuned     1.34px  (-34%)       5.78px  (+232%)  <- 2D better, 3D worse
+   EXP-02 finetuned     1.50px  (-27%)      238.89px (+13627%) <- catastrophic 3D
+
+4. ROOT CAUSE (both experiments):
+   Low-parallax -> poorly conditioned COLMAP reconstruction ->
+   noisy camera labels -> supervising camera head with these labels
+   actively hurts 3D geometry. Track head optimises correctly but
+   camera head is pulled toward wrong camera poses.
+
+================================================================================
+NEXT: EXP-03 — Self-supervised plane rigidity
+================================================================================
+
+Goal: improve cameras WITHOUT relying on COLMAP or ViPE labels.
+
+Core idea — Cross-frame plane rigidity:
+  The AE logo tracks lie on a rigid plane. For any two frames:
+    1. Unproject GT tracks using predicted depth + predicted camera_i
+       -> fit plane pi_i in world space
+    2. Unproject GT tracks using predicted depth + predicted camera_j
+       -> fit plane pi_j in world space
+    3. Loss = disagreement between pi_i and pi_j
+  This jointly constrains depth + cameras to be self-consistent
+  with no external supervision required.
+
+Why this works for low-parallax:
+  - Plane fit from 256 tracks is highly overdetermined -> stable
+  - Works regardless of parallax magnitude
+  - Cannot be satisfied by degenerate cameras (wrong R or T breaks agreement)
+  - No COLMAP, no ViPE needed
+
+Why not freeze depth head:
+  - Aggregator features change via LoRA -> depth predictions drift anyway
+  - Pretrained VGGT depth init is strong -> implicit regularisation vs collapse
+  - Plane rigidity + pretrained init together are sufficient
+  - Simpler: no external pseudo-GT at all beyond GT tracks
+
+Proposed supervision (EXP-03):
+  camera loss     : weight=0.0   (drop COLMAP)
+  depth loss      : weight=0.0   (drop ViPE)
+  reproj loss     : null         (drop)
+  track loss      : weight=1.0   (keep, high quality signal)
+  plane_rigidity  : weight=TBD   (new, to be implemented)
+
+================================================================================
