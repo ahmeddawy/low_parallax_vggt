@@ -400,27 +400,36 @@ def _render_frame(image_path, fi, gt_tracks_orig, gt_vis_mask,
     dot_r_gt = 4
     dot_r_pred = 4
 
+    # Subpixel rendering: use cv2 shift=4 (1/16 px precision + anti-aliasing).
+    # This avoids the integer-rounding jitter when GT motion is <1px per frame.
+    _SHIFT = 4
+    _S16 = 1 << _SHIFT  # 16
+
     for tid in sampled_ids:
         # GT position (same for both panels)
         if gt_vis_mask[fi, tid]:
-            gx = int(round(float(gt_tracks_orig[fi, tid, 0]) * sx))
-            gy = int(round(float(gt_tracks_orig[fi, tid, 1]) * sy))
-            cv2.circle(left,  (gx, gy), dot_r_gt, _GT_COLOR[::-1], -1)
-            cv2.circle(right, (gx, gy), dot_r_gt, _GT_COLOR[::-1], -1)
+            gx_s = int(float(gt_tracks_orig[fi, tid, 0]) * sx * _S16)
+            gy_s = int(float(gt_tracks_orig[fi, tid, 1]) * sy * _S16)
+            cv2.circle(left,  (gx_s, gy_s), dot_r_gt * _S16,
+                       _GT_COLOR[::-1], -1, cv2.LINE_AA, _SHIFT)
+            cv2.circle(right, (gx_s, gy_s), dot_r_gt * _S16,
+                       _GT_COLOR[::-1], -1, cv2.LINE_AA, _SHIFT)
 
         # Vanilla (left panel)
         if "vanilla" in preds_by_tag:
             van_tracks, _ = preds_by_tag["vanilla"]
-            vx = int(round(float(van_tracks[fi, tid, 0]) * sx))
-            vy = int(round(float(van_tracks[fi, tid, 1]) * sy))
-            cv2.circle(left, (vx, vy), dot_r_pred, _VAN_COLOR[::-1], 2)
+            vx_s = int(float(van_tracks[fi, tid, 0]) * sx * _S16)
+            vy_s = int(float(van_tracks[fi, tid, 1]) * sy * _S16)
+            cv2.circle(left, (vx_s, vy_s), dot_r_pred * _S16,
+                       _VAN_COLOR[::-1], 2, cv2.LINE_AA, _SHIFT)
 
         # Finetuned (right panel)
         if "finetuned" in preds_by_tag:
             ft_tracks, _ = preds_by_tag["finetuned"]
-            fx = int(round(float(ft_tracks[fi, tid, 0]) * sx))
-            fy = int(round(float(ft_tracks[fi, tid, 1]) * sy))
-            cv2.circle(right, (fx, fy), dot_r_pred, _FT_COLOR[::-1], 2)
+            fx_s = int(float(ft_tracks[fi, tid, 0]) * sx * _S16)
+            fy_s = int(float(ft_tracks[fi, tid, 1]) * sy * _S16)
+            cv2.circle(right, (fx_s, fy_s), dot_r_pred * _S16,
+                       _FT_COLOR[::-1], 2, cv2.LINE_AA, _SHIFT)
 
     # Panel labels (top-left corner of each panel)
     font = cv2.FONT_HERSHEY_SIMPLEX
