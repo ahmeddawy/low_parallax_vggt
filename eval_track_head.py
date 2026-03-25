@@ -19,13 +19,14 @@ Metrics (reported in original image resolution):
 
 Usage:
     python eval_track_head.py \
-        --vanilla-ckpt   /workspace/model.pt \
-        --finetuned-ckpt /workspace/ckpts/checkpoint.pt \
-        --dataset-dir    /mnt/bucket/.../tracking_whisper_sample_dataset \
-        --split-file     /mnt/bucket/.../val_split.txt \
+        --vanilla-ckpt    /workspace/model.pt \
+        --finetuned-ckpt  /workspace/ckpts/checkpoint.pt \
+        --dataset-dir     /mnt/bucket/.../tracking_whisper_sample_dataset \
+        --train-split-file /mnt/bucket/.../train_split.txt \
+        --val-split-file   /mnt/bucket/.../val_split.txt \
         [--lora] [--lora-r 16] [--lora-alpha 32] \
-        [--track-chunk   256] \
-        [--output-json   track_eval_results.json]
+        [--track-chunk    256] \
+        [--output-json    track_eval_results.json]
 """
 
 import argparse
@@ -51,7 +52,8 @@ def parse_args():
     p.add_argument("--vanilla-ckpt",          required=True,  help="Path to vanilla VGGT checkpoint")
     p.add_argument("--finetuned-ckpt",        required=True,  help="Path to fine-tuned checkpoint")
     p.add_argument("--dataset-dir",           required=True,  help="Root dataset directory")
-    p.add_argument("--split-file",            required=True,  help="Text file: one sequence name per line")
+    p.add_argument("--train-split-file",      required=True,  help="Train split: one sequence name per line")
+    p.add_argument("--val-split-file",        required=True,  help="Val split: one sequence name per line")
     p.add_argument("--lora",                  action="store_true", default=False,
                    help="Fine-tuned ckpt is LoRA (wrap aggregator with PEFT before loading)")
     p.add_argument("--lora-r",                type=int,   default=16)
@@ -304,17 +306,91 @@ def mean_over_seqs(seq_results, keys):
     return {k: float(np.mean(v)) for k, v in vals.items()}
 
 
+def eval_split(split_name, sequences, dataset_dir, models, chunk_size, vis_thresh, device, dtype):
+    """
+    Run evaluation for all sequences in one split.
+    models: dict of tag -> model
+    Returns: dict of tag -> {seq -> metrics}
+    """
+    metric_keys = ["ate", "median_te", "delta_1px", "delta_2px", "delta_5px", "delta_10px", "vis_acc"]
+    results = {tag: {} for tag in models}
+
+    print(f"\n{'='*70}")
+    print(f"SPLIT: {split_name.upper()} ({len(sequences)} sequences)")
+    print('='*70)
+
+    for seq in sequences:
+        print(f"\n  [{seq}]")
+        for tag, model in models.items():
+            metrics, err = eval_sequence(
+                seq, dataset_dir, model,
+                chunk_size, vis_thresh, device, dtype,
+            )
+            if err:
+                print(f"    {tag:10s}  SKIP ({err})")
+                continue
+            results[tag][seq] = metrics
+            print(
+                f"    {tag:10s}  "
+                f"ATE={metrics['ate']:6.2f}px  "
+                f"med={metrics['median_te']:6.2f}px  "
+                f"δ1={metrics['delta_1px']:.3f}  "
+                f"δ2={metrics['delta_2px']:.3f}  "
+                f"δ5={metrics['delta_5px']:.3f}  "
+                f"vis={metrics['vis_acc']:.3f}  "
+                f"N={metrics['n_points']}"
+            )
+
+    # Per-split aggregate + comparison
+    print(f"\n  --- {split_name.upper()} aggregate ---")
+    agg_by_tag = {}
+    for tag in models:
+        seqs = results[tag]
+        if not seqs:
+            print(f"  {tag.upper()}: no sequences evaluated")
+            continue
+        agg = mean_over_seqs(seqs, metric_keys)
+        agg_by_tag[tag] = agg
+        results[f"{tag}_mean"] = agg
+        print(
+            f"  {tag.upper()} ({len(seqs)} seqs)  "
+            f"ATE={agg['ate']:.2f}px  "
+            f"med={agg['median_te']:.2f}px  "
+            f"δ1={agg['delta_1px']:.3f}  "
+            f"δ2={agg['delta_2px']:.3f}  "
+            f"δ5={agg['delta_5px']:.3f}  "
+            f"vis={agg['vis_acc']:.3f}"
+        )
+
+    if "vanilla" in agg_by_tag and "finetuned" in agg_by_tag:
+        v  = agg_by_tag["vanilla"]
+        ft = agg_by_tag["finetuned"]
+        ate_delta = ft["ate"] - v["ate"]
+        d5_delta  = ft["delta_5px"] - v["delta_5px"]
+        print(f"\n  IMPROVEMENT vanilla → finetuned:")
+        print(f"    ATE:    {v['ate']:.2f} → {ft['ate']:.2f} px  ({ate_delta:+.2f}px, {ate_delta/v['ate']*100:+.1f}%)")
+        print(f"    δ5:     {v['delta_5px']:.3f} → {ft['delta_5px']:.3f}  ({d5_delta*100:+.1f}pp)")
+        print(f"    vis_acc:{v['vis_acc']:.3f} → {ft['vis_acc']:.3f}")
+
+    return results
+
+
 def main():
     args   = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype  = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-    with open(args.split_file) as f:
-        sequences = [l.strip() for l in f if l.strip()]
-    print(f"Split: {args.split_file} — {len(sequences)} sequences")
+    def load_sequences(path):
+        with open(path) as f:
+            return [l.strip() for l in f if l.strip()]
 
-    # Load models
-    print(f"\nLoading vanilla model  : {args.vanilla_ckpt}")
+    train_seqs = load_sequences(args.train_split_file)
+    val_seqs   = load_sequences(args.val_split_file)
+    print(f"Train split: {args.train_split_file} — {len(train_seqs)} sequences")
+    print(f"Val   split: {args.val_split_file}   — {len(val_seqs)} sequences")
+
+    # Load models once, reuse for both splits
+    print(f"\nLoading vanilla model   : {args.vanilla_ckpt}")
     vanilla_model = load_model(args.vanilla_ckpt, device=device)
 
     print(f"Loading fine-tuned model: {args.finetuned_ckpt}")
@@ -327,63 +403,34 @@ def main():
         device=device,
     )
 
-    results = {"vanilla": {}, "finetuned": {}}
-    metric_keys = ["ate", "median_te", "delta_1px", "delta_2px", "delta_5px", "delta_10px", "vis_acc"]
+    models = {"vanilla": vanilla_model, "finetuned": ft_model}
 
-    for seq in sequences:
-        print(f"\n[{seq}]")
-        for tag, model in [("vanilla", vanilla_model), ("finetuned", ft_model)]:
-            metrics, err = eval_sequence(
-                seq, args.dataset_dir, model,
-                args.track_chunk, args.vis_thresh, device, dtype,
-            )
-            if err:
-                print(f"  {tag:10s}  SKIP ({err})")
-                continue
-            results[tag][seq] = metrics
-            print(
-                f"  {tag:10s}  "
-                f"ATE={metrics['ate']:6.2f}px  "
-                f"med={metrics['median_te']:6.2f}px  "
-                f"δ1={metrics['delta_1px']:.3f}  "
-                f"δ2={metrics['delta_2px']:.3f}  "
-                f"δ5={metrics['delta_5px']:.3f}  "
-                f"vis={metrics['vis_acc']:.3f}  "
-                f"N={metrics['n_points']}"
-            )
-
-    # Aggregate means
-    print("\n" + "=" * 70)
-    for tag in ("vanilla", "finetuned"):
-        seqs = results[tag]
-        if not seqs:
-            print(f"{tag.upper()}: no sequences evaluated")
-            continue
-        agg = mean_over_seqs(seqs, metric_keys)
-        results[f"{tag}_mean"] = agg
-        print(
-            f"{tag.upper()} ({len(seqs)} seqs)  "
-            f"ATE={agg['ate']:.2f}px  "
-            f"med={agg['median_te']:.2f}px  "
-            f"δ1={agg['delta_1px']:.3f}  "
-            f"δ2={agg['delta_2px']:.3f}  "
-            f"δ5={agg['delta_5px']:.3f}  "
-            f"vis={agg['vis_acc']:.3f}"
+    all_results = {}
+    for split_name, seqs in [("train", train_seqs), ("val", val_seqs)]:
+        split_results = eval_split(
+            split_name, seqs, args.dataset_dir, models,
+            args.track_chunk, args.vis_thresh, device, dtype,
         )
+        all_results[split_name] = split_results
 
-    # Side-by-side comparison
-    if "vanilla_mean" in results and "finetuned_mean" in results:
-        v  = results["vanilla_mean"]
-        ft = results["finetuned_mean"]
-        print("\nIMPROVEMENT (vanilla → finetuned, negative ATE = better):")
-        ate_delta = ft["ate"] - v["ate"]
-        d5_delta  = ft["delta_5px"] - v["delta_5px"]
-        print(f"  ATE:    {v['ate']:.2f} → {ft['ate']:.2f} px  ({ate_delta:+.2f}px, {ate_delta/v['ate']*100:+.1f}%)")
-        print(f"  δ5:     {v['delta_5px']:.3f} → {ft['delta_5px']:.3f}  ({d5_delta*100:+.1f}pp)")
-        print(f"  vis_acc:{v['vis_acc']:.3f} → {ft['vis_acc']:.3f}")
+    # Final cross-split summary
+    print(f"\n{'='*70}")
+    print("SUMMARY  (train vs val — checks for overfitting)")
+    print('='*70)
+    for tag in ("vanilla", "finetuned"):
+        for split_name in ("train", "val"):
+            key = f"{tag}_mean"
+            if key in all_results.get(split_name, {}):
+                agg = all_results[split_name][key]
+                print(
+                    f"  {tag:10s} {split_name:5s}  "
+                    f"ATE={agg['ate']:.2f}px  "
+                    f"δ5={agg['delta_5px']:.3f}  "
+                    f"vis={agg['vis_acc']:.3f}"
+                )
 
     with open(args.output_json, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(all_results, f, indent=2)
     print(f"\nSaved results to {args.output_json}")
 
 
