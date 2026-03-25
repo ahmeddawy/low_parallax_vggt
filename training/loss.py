@@ -961,6 +961,20 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
         z    = proj[..., 2:3].clamp(min=0.1)
         uv_pred = proj[..., :2] / z   # B, N, 2
 
+        # Mask out degenerate projections: tracks that project behind the camera
+        # (raw z < 0.5) or wildly off-screen (>2x image size).
+        # These are caused by noisy COLMAP rotations producing bad z values.
+        # The cross-gradient d(uv_x)/d(cam_z) = -fx*cam_x/z^2 blows up when
+        # cam_x~1e3 (after clamp) and z~0.1 → gradient~1e5 → NaN in depth head.
+        raw_z = proj[..., 2]   # B, N (before clamp)
+        in_front  = raw_z > 0.5                                       # B, N
+        in_bounds = (uv_pred[..., 0].abs() < 2 * W) & \
+                    (uv_pred[..., 1].abs() < 2 * H)                   # B, N
+        valid_j = valid_j & in_front & in_bounds
+
+        if not valid_j.any():
+            continue
+
         # Huber loss (smooth_l1, delta=1.0px): quadratic for |err|<1px, linear above.
         # More robust than L1 — reduces gradient for moderately-large errors while
         # still penalising large outliers. Tighter clamp (5px) catches bad batches early.
