@@ -509,20 +509,44 @@ def visualize_sequence(
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{seq_name}.mp4")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (vid_w, vid_h))
+    # Write frames to a temp directory, then encode with ffmpeg (H.264).
+    # This avoids the corrupted-file issue with cv2.VideoWriter + mp4v.
+    import tempfile
+    import subprocess
+    import shutil
 
-    for fi in range(S):
-        frame_rgb = _render_frame(
-            image_paths[fi], fi,
-            gt_tracks_orig, gt_vis_mask,
-            preds_by_tag, sampled_ids,
-            sx, sy, W_disp, H_disp,
+    tmp_dir = tempfile.mkdtemp(prefix="track_viz_")
+    try:
+        for fi in range(S):
+            frame_rgb = _render_frame(
+                image_paths[fi], fi,
+                gt_tracks_orig, gt_vis_mask,
+                preds_by_tag, sampled_ids,
+                sx, sy, W_disp, H_disp,
+            )
+            frame_path = os.path.join(tmp_dir, f"{fi:06d}.jpg")
+            cv2.imwrite(frame_path, frame_rgb[:, :, ::-1],
+                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", os.path.join(tmp_dir, "%06d.jpg"),
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            out_path,
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True
         )
-        # cv2 expects BGR
-        writer.write(frame_rgb[:, :, ::-1])
+        if result.returncode != 0:
+            print(f"    [viz] ffmpeg failed: {result.stderr[-300:]}")
+            return
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    writer.release()
     print(f"    [viz] -> {out_path}  ({S} frames @ {fps}fps)")
 
 
