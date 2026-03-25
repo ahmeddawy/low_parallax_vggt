@@ -955,29 +955,16 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
 
         # Project: [u, v] = K_j @ P_cam_j / z
         proj = torch.bmm(cam_pts_j, Kj.transpose(-1, -2))   # B, N, 3
-        # Tighter z clamp: min=0.1 instead of 1e-3.
-        # At the clamp boundary, d(uv)/d(cam) = 1/z. With 1e-3 → gradient=1000;
-        # with 0.1 → gradient=10. This is the primary source of reproj gradient spikes.
-        z    = proj[..., 2:3].clamp(min=0.1)
-        uv_pred = proj[..., :2] / z   # B, N, 2
 
-        # Mask out degenerate projections: tracks that project behind the camera
-        # (raw z < 0.5) or wildly off-screen (>2x image size).
-        # These are caused by noisy COLMAP rotations producing bad z values.
-        # The cross-gradient d(uv_x)/d(cam_z) = -fx*cam_x/z^2 blows up when
-        # cam_x~1e3 (after clamp) and z~0.1 → gradient~1e5 → NaN in depth head.
-        raw_z = proj[..., 2]   # B, N (before clamp)
-        in_front  = raw_z > 0.5                                       # B, N
-        in_bounds = (uv_pred[..., 0].abs() < 2 * W) & \
-                    (uv_pred[..., 1].abs() < 2 * H)                   # B, N
-        valid_j = valid_j & in_front & in_bounds
-
-        if not valid_j.any():
-            continue
+        # Detach z from the denominator to eliminate the cross-gradient blow-up.
+        # d(uv_x)/d(z) = -fx * cam_x / z^2. With cam_x~1e3 (after clamp) and
+        # z~0.1, this reaches ~1e5 → NaN in depth head. By detaching z, gradient
+        # flows only through proj[...,:2] (the numerator), which is bounded.
+        # The loss value is unchanged; only the gradient path is cut at this term.
+        z         = proj[..., 2:3].clamp(min=0.1)
+        uv_pred   = proj[..., :2] / z.detach()   # B, N, 2
 
         # Huber loss (smooth_l1, delta=1.0px): quadratic for |err|<1px, linear above.
-        # More robust than L1 — reduces gradient for moderately-large errors while
-        # still penalising large outliers. Tighter clamp (5px) catches bad batches early.
         diff = uv_pred - gt_tracks[:, j, :, :]          # B, N, 2
         err = F.huber_loss(diff, torch.zeros_like(diff), delta=1.0, reduction='none').mean(dim=-1)  # B, N
         err = check_and_fix_inf_nan(err, f"reproj_err_j{j}", hard_max=None)
