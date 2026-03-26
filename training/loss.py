@@ -1212,7 +1212,7 @@ def compute_plane_rigidity_loss(
         world_mean = (world_pts * vis_f).sum(dim=1) / vis_sum  # B, N, 3
 
         diff    = world_pts - world_mean.unsqueeze(1)        # B, S, N, 3
-        l2_dist = (diff * diff).sum(dim=-1).clamp(min=0).sqrt()  # B, S, N
+        l2_dist = (diff * diff).sum(dim=-1).add(1e-6).sqrt()  # B, S, N  — eps prevents 1/(2√x)→∞ in backward
 
         consistency_loss = l2_dist[loss_mask].mean()
         consistency_loss = check_and_fix_inf_nan(
