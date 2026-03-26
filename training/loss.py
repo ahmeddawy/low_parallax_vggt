@@ -1057,7 +1057,7 @@ def _render_plane_fitting_figure(world_pts_f32, normals, offsets):
 
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+    img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
     plt.close(fig)
 
     return torch.from_numpy(img.copy()).permute(2, 0, 1)  # 3, H, W  uint8
