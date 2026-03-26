@@ -24,7 +24,7 @@ class MultitaskLoss(torch.nn.Module):
     - Point loss
     - Tracking loss
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, reproj=None, **kwargs):
+    def __init__(self, camera=None, depth=None, point=None, track=None, reproj=None, plane_rigidity=None, **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
@@ -32,6 +32,7 @@ class MultitaskLoss(torch.nn.Module):
         self.point = point
         self.track = track
         self.reproj = reproj
+        self.plane_rigidity = plane_rigidity
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -109,6 +110,18 @@ class MultitaskLoss(torch.nn.Module):
             if reproj_loss is not None:
                 total_loss = total_loss + reproj_loss * self.reproj.get("weight", 1.0)
                 loss_dict["loss_reproj"] = reproj_loss
+
+        # Plane rigidity loss — self-supervised cross-frame 3D consistency for rigid plane tracks
+        if (
+            self.plane_rigidity is not None
+            and "pose_enc_list" in predictions
+            and "depth" in predictions
+            and "tracks" in batch
+        ):
+            plane_loss = compute_plane_rigidity_loss(predictions, batch, **self.plane_rigidity)
+            if plane_loss is not None:
+                total_loss = total_loss + plane_loss * self.plane_rigidity.get("weight", 1.0)
+                loss_dict["loss_plane_rigidity"] = plane_loss
 
         loss_dict["objective"] = total_loss
 
@@ -969,6 +982,105 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
         return None
 
     return total_loss / n_valid
+
+
+def compute_plane_rigidity_loss(predictions, batch, weight=1.0, min_visible_frames=2, **kwargs):
+    """
+    Self-supervised cross-frame 3D consistency loss for rigid plane tracks.
+
+    The GT tracks lie on a rigid plane (the AE logo). Unprojecting each track
+    using the predicted depth and predicted camera for that frame should yield
+    the same world-space 3D point regardless of which frame is used.
+
+    Loss = mean variance of the unprojected world points across frames, per track.
+           Zero iff every frame's (depth, camera) pair agrees on the same 3D point.
+
+    Gradient flows jointly through depth head and camera head — no external labels.
+
+    Args:
+        predictions : dict with "pose_enc_list" (list of B,S,9) and "depth" (B,S,H,W,1)
+        batch       : dict with "tracks" (B,S,N,2) and "track_vis_mask" (B,S,N bool)
+        weight      : scalar (absorbed by caller, kept for **kwargs compat)
+        min_visible_frames : minimum number of frames a track must be visible in
+                             to contribute to the loss (need ≥2 to compute variance)
+
+    Returns:
+        Scalar loss tensor, or None if no valid tracks.
+    """
+    if "tracks" not in batch or batch["tracks"] is None:
+        return None
+
+    gt_tracks = batch["tracks"]          # B, S, N, 2
+    gt_vis    = batch["track_vis_mask"]  # B, S, N  (bool)
+    _, S, _, _ = gt_tracks.shape
+
+    # Only supervise tracks visible in at least min_visible_frames frames
+    n_vis = gt_vis.sum(dim=1)                          # B, N
+    valid_tracks = n_vis >= min_visible_frames          # B, N
+    if not valid_tracks.any():
+        return None
+
+    H, W = batch["images"].shape[-2:]
+
+    # Decode last-stage pose encoding → extrinsics (B,S,3,4), intrinsics (B,S,3,3)
+    pred_pose_enc = predictions["pose_enc_list"][-1]
+    pred_extrinsics, pred_intrinsics = pose_encoding_to_extri_intri(pred_pose_enc, (H, W))
+
+    # Unproject GT tracks in every frame independently → world-space 3D points
+    world_pts_list = []  # will be S tensors of shape (B, N, 3)
+
+    for i in range(S):
+        pred_depth_i = predictions["depth"][:, i, :, :, 0]  # B, H, W
+        track_i      = gt_tracks[:, i, :, :]                 # B, N, 2
+
+        # Bilinear sample of predicted depth at track positions
+        norm_u = (track_i[..., 0] / (W - 1)) * 2.0 - 1.0   # B, N
+        norm_v = (track_i[..., 1] / (H - 1)) * 2.0 - 1.0   # B, N
+        grid   = torch.stack([norm_u, norm_v], dim=-1).unsqueeze(1)  # B, 1, N, 2
+        depth_i = F.grid_sample(
+            pred_depth_i.unsqueeze(1),
+            grid, mode="bilinear", align_corners=True,
+        ).squeeze(1).squeeze(1).clamp(min=1e-3, max=1e3)    # B, N
+
+        # Unproject to camera space: P_cam = K^{-1} [u,v,1] * d
+        Ki  = pred_intrinsics[:, i, :, :]                    # B, 3, 3
+        fx  = Ki[:, 0, 0].clamp(min=1e-2)                   # B
+        fy  = Ki[:, 1, 1].clamp(min=1e-2)                   # B
+        cx  = Ki[:, 0, 2]                                    # B
+        cy  = Ki[:, 1, 2]                                    # B
+        x_c = (track_i[..., 0] - cx.unsqueeze(1)) / fx.unsqueeze(1) * depth_i  # B, N
+        y_c = (track_i[..., 1] - cy.unsqueeze(1)) / fy.unsqueeze(1) * depth_i  # B, N
+        cam_pts_i = torch.stack([x_c, y_c, depth_i], dim=-1)                   # B, N, 3
+
+        # Transform to world space: P_world = R^T @ (P_cam - t)
+        Ei = pred_extrinsics[:, i, :, :]                     # B, 3, 4
+        Ri = Ei[:, :, :3]                                    # B, 3, 3
+        ti = Ei[:, :, 3]                                     # B, 3
+        world_i = torch.bmm(cam_pts_i - ti.unsqueeze(1), Ri) # B, N, 3
+        world_i = world_i.clamp(min=-1e3, max=1e3)
+
+        world_pts_list.append(world_i)
+
+    # Stack across frames: (B, S, N, 3)
+    world_pts = torch.stack(world_pts_list, dim=1)
+
+    # Visibility-masked mean world position per track across frames
+    vis_f   = gt_vis.unsqueeze(-1).float()                   # B, S, N, 1
+    vis_sum = vis_f.sum(dim=1).clamp(min=1.0)               # B, N, 1
+    world_mean = (world_pts * vis_f).sum(dim=1) / vis_sum    # B, N, 3
+
+    # Squared distance of each frame's unproject from the cross-frame mean
+    diff   = world_pts - world_mean.unsqueeze(1)             # B, S, N, 3
+    sq_dist = (diff * diff).sum(dim=-1)                      # B, S, N
+
+    # Mask: frame must be visible AND track must appear in enough frames
+    loss_mask = gt_vis & valid_tracks.unsqueeze(1)           # B, S, N
+    if not loss_mask.any():
+        return None
+
+    loss = sq_dist[loss_mask].mean()
+    loss = check_and_fix_inf_nan(loss, "plane_rigidity_loss", hard_max=100.0)
+    return loss
 
 
 def reduce_masked_mean(x, mask, dim=None, keepdim=False):

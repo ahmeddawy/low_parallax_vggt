@@ -1,0 +1,252 @@
+exp_name: rembrand_plane_rigidity_v1
+# EXP-03: Self-supervised plane rigidity.
+# Drops all external supervision (COLMAP camera, ViPE depth).
+# Only GT AE track loss + cross-frame 3D consistency loss (plane_rigidity).
+#
+# Plane rigidity loss:
+#   Unprojecting GT tracks using predicted depth + predicted camera for each frame
+#   independently should yield the same world-space 3D point (rigid plane).
+#   Loss = mean variance of unprojected world points across visible frames, per track.
+#   Gradient flows jointly through depth head and camera head — no labels needed.
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 1
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 48
+
+limit_train_batches: 28
+limit_val_batches:   5
+
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: True
+    pin_memory: False
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      load_track: True
+      track_num: 256
+      use_gt_tracks: True
+      use_depth_tracks: False
+      training: True
+      inside_random: True
+      rescale: True
+      rescale_aug: True
+      landscape_check: False
+      debug: False
+      get_nearby: False
+      load_depth: True       # ColmapDataset always loads depth; GT depth unused (depth loss is null)
+      img_nums: [8, 24]
+      max_img_per_gpu: ${max_img_per_gpu}
+      allow_duplicate_img: False
+      repeat_batch: False
+      augs:
+        cojitter: True
+        cojitter_ratio: 0.3
+        scales: [0.8, 1.2]
+        aspects: [0.5625, 0.5625]
+        color_jitter:
+          brightness: 0.3
+          contrast:   0.3
+          saturation: 0.3
+          hue:        0.05
+          p: 0.8
+        gray_scale: True
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.colmap.ColmapDataset
+          split: train
+          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/
+          depth_dir_name: masked_depth
+          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/train_split.txt
+
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: False
+    pin_memory: False
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      load_track: True
+      track_num: 256
+      use_gt_tracks: True
+      use_depth_tracks: False
+      training: False
+      inside_random: True
+      rescale: True
+      rescale_aug: False
+      landscape_check: False
+      debug: False
+      get_nearby: False
+      load_depth: False      # Consistent with train — no depth labels at all
+      img_nums: [8, 16]
+      allow_duplicate_img: False
+      augs:
+        cojitter: False
+        cojitter_ratio: 0.5
+        scales: null
+        aspects: [0.5625, 0.5625]
+        color_jitter: null
+        gray_scale: False
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.colmap.ColmapDataset
+          split: val
+          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/
+          depth_dir_name: masked_depth
+          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/val_split.txt
+
+
+logging:
+  log_dir: /mnt/bucket/dawy/law_parallax_vggt_exp1/${exp_name}
+  log_visuals: False
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - objective
+        - loss_track
+        - loss_vis_track
+        - loss_conf_track
+        - loss_plane_rigidity
+    val:
+      keys_to_log:
+        - objective
+        - loss_track
+        - loss_vis_track
+        - loss_conf_track
+        - loss_plane_rigidity
+
+
+checkpoint:
+  save_dir: /workspace/low_parallax_vggt/ckpts/${exp_name}
+  save_freq: 5
+  resume_checkpoint_path: null
+  strict: False
+
+
+loss:
+  _target_: loss.MultitaskLoss
+
+  camera: null    # COLMAP supervision dropped — noisy on low-parallax, degrades camera head
+
+  depth: null     # ViPE supervision dropped — confidence collapse + gradient spikes in EXP-01/02
+
+  point: null
+
+  track:
+    weight: 1.0   # GT AE tracks — high quality, genuine generalisation signal
+
+  reproj: null
+
+  plane_rigidity:
+    weight: 0.1             # Start conservative — plane rigidity loss is in squared world-unit space
+                            # (normalised scene scale ~1), so 0.1 keeps it on par with track loss ~0.06
+    min_visible_frames: 2   # Minimum frames a track must appear in to contribute (need ≥2 for variance)
+
+
+optim:
+  param_group_modifiers: False
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 5e-5
+    weight_decay: 0.05
+
+  frozen_module_names: null
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["depth"]
+        max_norm: 0.5
+        norm_type: 2
+      - module_name: ["camera"]
+        max_norm: 0.5
+        norm_type: 2
+      - module_name: ["track"]
+        max_norm: 1.0
+        norm_type: 2
+
+  lora:
+    pretrained_checkpoint_path: /workspace/low_parallax_vggt/model.pt
+    r: 16
+    lora_alpha: 32
+    target_modules:
+      - qkv
+      - proj
+    lora_dropout: 0.0
+    fresh_heads: False
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 5e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 5e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.05
+
+
+max_epochs: 100
+
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: True
+  enable_depth: True
+  enable_point: False
+  enable_track: True
+
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: False
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True
