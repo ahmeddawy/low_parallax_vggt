@@ -50,7 +50,12 @@ EXPERIMENTS = {
     },
 }
 
-STATUS_OUT = "/mnt/bucket/dawy/monitoring/status.json"
+# Per-experiment status files (one per pod, keyed by exp_id slug)
+STATUS_DIR = "/mnt/bucket/dawy/monitoring"
+STATUS_FILES = {
+    "EXP-03a": f"{STATUS_DIR}/exp03a_status.json",
+    "EXP-03b": f"{STATUS_DIR}/exp03b_status.json",
+}
 
 # ── What to watch ─────────────────────────────────────────────────────────────
 
@@ -280,11 +285,12 @@ def main() -> None:
             all_reports.append(report)
 
         if args.write_status:
-            out_path = Path(STATUS_OUT)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(out_path, "w") as fh:
-                json.dump(all_reports, fh, indent=2)
-            print(f"\n  Status written → {STATUS_OUT}")
+            for report in all_reports:
+                out_path = Path(STATUS_FILES[report["exp_id"]])
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_path, "w") as fh:
+                    json.dump(report, fh, indent=2)
+                print(f"\n  Status written → {out_path}")
 
         if args.watch <= 0:
             break

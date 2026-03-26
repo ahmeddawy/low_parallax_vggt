@@ -23,7 +23,7 @@ spec:
               cd /workspace/vggt && git checkout plane-rigidity
               pip install -e /workspace/vggt -q
               # Background monitor: writes status.json to GCS every 10 min
-              python /workspace/vggt/scripts/monitor.py --watch 10 --write-status &
+              python /workspace/vggt/scripts/monitor.py --exp EXP-03b --watch 10 --write-status &
               # Run training (foreground); pod stays alive after exit for inspection
               torchrun --nproc_per_node=8 /workspace/vggt/training/train.py \
                 --config-name rembrand_exp03b
