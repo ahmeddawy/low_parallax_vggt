@@ -28,7 +28,7 @@ spec:
                 "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
               # Run training from inside training/ (Hydra config discovery)
               cd /workspace/vggt/training
-              torchrun --nproc_per_node=8 launch.py --config-name rembrand_exp03b
+              torchrun --nproc_per_node=8 launch.py --config rembrand_exp03b
               echo "=== Training finished or crashed — pod staying alive for inspection ==="
               sleep infinity
           volumeMounts:
