@@ -258,7 +258,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--write-status", action="store_true",
-        help=f"Write JSON status to {STATUS_OUT} after each check",
+        help=f"Write JSON status to {STATUS_DIR}/<exp>_status.json after each check",
     )
     parser.add_argument(
         "--exp", choices=list(EXPERIMENTS.keys()), default=None,
