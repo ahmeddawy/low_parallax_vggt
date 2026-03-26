@@ -63,7 +63,7 @@ data:
         - _target_: data.datasets.colmap.ColmapDataset
           split: train
           DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/
-          depth_dir_name: masked_depth
+          depth_dir_name: depth
           sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/train_split.txt  # direct file path (one seq name per line)
 
   val:
@@ -105,7 +105,7 @@ data:
         - _target_: data.datasets.colmap.ColmapDataset
           split: val
           DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/
-          depth_dir_name: masked_depth
+          depth_dir_name: depth
           sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/val_split.txt
 
 
