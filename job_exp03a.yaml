@@ -26,8 +26,6 @@ spec:
               mkdir -p /workspace/low_parallax_vggt
               wget -q -O /workspace/low_parallax_vggt/model.pt \
                 "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-              # Background monitor: writes status.json to GCS every 10 min
-              python /workspace/vggt/scripts/monitor.py --exp EXP-03a --watch 5 --write-status &
               # Run training from inside training/ (Hydra config discovery)
               cd /workspace/vggt/training
               torchrun --nproc_per_node=8 launch.py --config-name rembrand
