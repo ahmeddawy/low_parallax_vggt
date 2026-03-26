@@ -822,14 +822,22 @@ class Trainer:
             query_points = None
         y_hat = model(images=batch["images"], query_points=query_points)
         
-        # Loss computation
-        loss_dict = self.loss(y_hat, batch)
-        
+        # Loss computation.
+        # Visualize plane fitting on the first step of every val epoch (rank 0 only).
+        # Adds matplotlib overhead so is gated strictly to avoid slowing down training.
+        should_viz = (
+            self.rank == 0
+            and phase == "val"
+            and self.steps[phase] == 0
+        )
+        loss_dict = self.loss(y_hat, batch, visualize=should_viz)
+
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}
 
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
         self._log_tb_visuals(log_data, phase, self.steps[phase])
+        self._log_plane_fitting_visual(loss_dict, phase, self.steps[phase])
 
         self.steps[phase] += 1
         return loss_dict
@@ -894,6 +902,15 @@ class Trainer:
                 name, visuals_to_log, step, self.logging_conf.video_logging_fps
             )
 
+    def _log_plane_fitting_visual(self, loss_dict: dict, phase: str, step: int) -> None:
+        """Logs the plane fitting visualisation image to TensorBoard if available."""
+        if not (self.rank == 0 and "vis_plane_fitting" in loss_dict):
+            return
+        vis = loss_dict["vis_plane_fitting"]   # (3, H, W) uint8
+        vis_float = vis.float() / 255.0        # (3, H, W) float in [0, 1]
+        self.tb_writer.log_visuals(
+            f"Visuals/{phase}/plane_fitting", vis_float.cpu(), step
+        )
 
 
 

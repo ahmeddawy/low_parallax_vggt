@@ -119,10 +119,18 @@ class MultitaskLoss(torch.nn.Module):
             and "depth" in predictions
             and has_tracks
         ):
-            plane_loss = compute_plane_rigidity_loss(predictions, batch, **self.plane_rigidity)
+            plane_result = compute_plane_rigidity_loss(
+                predictions, batch, visualize=visualize, **self.plane_rigidity
+            )
+            if visualize:
+                plane_loss, vis_image = plane_result if plane_result is not None else (None, None)
+            else:
+                plane_loss, vis_image = plane_result, None
             if plane_loss is not None:
                 total_loss = total_loss + plane_loss * self.plane_rigidity.get("weight", 1.0)
                 loss_dict["loss_plane_rigidity"] = plane_loss
+            if vis_image is not None:
+                loss_dict["vis_plane_fitting"] = vis_image
 
         loss_dict["objective"] = total_loss
 

@@ -1,11 +1,9 @@
-exp_name: rembrand_lora_r16_plane_rigidity_v1
-# EXP-03: Self-supervised plane rigidity loss.
-# Drops all external supervision (COLMAP camera, ViPE depth).
-# Cameras and depth are jointly constrained by cross-frame 3D point consistency of GT plane tracks.
-# Supervision: GT track head (weight=1.0) + plane rigidity (weight=0.1) + depth regularisation (weight=0.1).
-# camera.weight=0.0: COLMAP poses too noisy for low-parallax — proven to destroy 3D geometry (EXP-01/02).
-# depth.weight=0.1: small regulariser only — prevents depth head drift over 100 epochs, not supervision.
-# plane_rigidity.weight=0.1: conservative start — monitor Grad/camera; raise to 0.3 if signal too weak.
+exp_name: rembrand_lora_r16_plane_rigidity_v2
+# EXP-03b: Point consistency + plane fitting (both terms active).
+# Identical to EXP-03a (rembrand.yaml) except plane_weight=1.0 enables the SVD plane fitting term.
+# Plane fitting captures systematic errors (wrong rotation, wrong depth scale) that
+# point consistency may miss — normal variance + offset variance across frames.
+# Run in parallel with EXP-03a to compare whether the global plane constraint adds value.
 img_size: 518         # 1920×1080 → 518×291 at 16:9 (scale ≈0.27×). 1 model-px ≈ 3.7 original-px → ~4px precision floor.
 num_workers: 8
 seed_value: 42
@@ -193,7 +191,7 @@ loss:
   plane_rigidity:
     weight: 0.1             # Overall scale — multiplied by the caller before adding to total loss
     consistency_weight: 1.0 # Point consistency term — per-track L2 deviation from cross-frame mean
-    plane_weight: 0.0       # Plane fitting term — SVD normal+offset variance across frames (0=disabled for EXP-03a)
+    plane_weight: 1.0       # Plane fitting term — SVD normal+offset variance across frames (enabled for EXP-03b)
     min_visible_frames: 2   # Track must be visible in ≥2 frames to contribute
 
 
