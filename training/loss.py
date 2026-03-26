@@ -34,7 +34,7 @@ class MultitaskLoss(torch.nn.Module):
         self.reproj = reproj
         self.plane_rigidity = plane_rigidity
 
-    def forward(self, predictions, batch) -> torch.Tensor:
+    def forward(self, predictions, batch, visualize=False) -> torch.Tensor:
         """
         Compute the total multi-task loss.
         
@@ -48,15 +48,15 @@ class MultitaskLoss(torch.nn.Module):
         total_loss = 0
         loss_dict = {}
         
-        # Camera pose loss - if pose encodings are predicted
-        if "pose_enc_list" in predictions:
-            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)   
-            camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]   
+        # Camera pose loss - if pose encodings are predicted AND camera loss is configured
+        if self.camera is not None and "pose_enc_list" in predictions:
+            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)
+            camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]
             total_loss = total_loss + camera_loss
             loss_dict.update(camera_loss_dict)
-        
-        # Depth estimation loss - if depth maps are predicted
-        if "depth" in predictions:
+
+        # Depth estimation loss - if depth maps are predicted AND depth loss is configured
+        if self.depth is not None and "depth" in predictions:
             depth_loss_dict = compute_depth_loss(predictions, batch, **self.depth)
             depth_loss = (
                 depth_loss_dict["loss_conf_depth"]
@@ -68,8 +68,8 @@ class MultitaskLoss(torch.nn.Module):
             total_loss = total_loss + depth_loss
             loss_dict.update(depth_loss_dict)
 
-        # 3D point reconstruction loss - if world points are predicted
-        if "world_points" in predictions:
+        # 3D point reconstruction loss - if world points are predicted AND point loss is configured
+        if self.point is not None and "world_points" in predictions:
             point_loss_dict = compute_point_loss(predictions, batch, **self.point)
             point_loss = (
                 point_loss_dict["loss_conf_point"]
@@ -82,7 +82,8 @@ class MultitaskLoss(torch.nn.Module):
             loss_dict.update(point_loss_dict)
 
         # Tracking loss
-        if "track_list" in predictions and self.track is not None and "tracks" in batch:
+        has_tracks = batch.get("tracks") is not None
+        if "track_list" in predictions and self.track is not None and has_tracks:
             track_loss, vis_loss, conf_loss = compute_track_loss(
                 predictions["track_list"],
                 predictions["vis"],
@@ -98,13 +99,13 @@ class MultitaskLoss(torch.nn.Module):
                 loss_dict["loss_track"] = track_loss
                 loss_dict["loss_vis_track"] = vis_loss
                 loss_dict["loss_conf_track"] = conf_loss
-        
+
         # Reprojection loss — jointly constrains predicted depth + poses via GT plane tracks
         if (
             self.reproj is not None
             and "pose_enc_list" in predictions
             and "depth" in predictions
-            and "tracks" in batch
+            and has_tracks
         ):
             reproj_loss = compute_reprojection_loss(predictions, batch, **self.reproj)
             if reproj_loss is not None:
@@ -116,7 +117,7 @@ class MultitaskLoss(torch.nn.Module):
             self.plane_rigidity is not None
             and "pose_enc_list" in predictions
             and "depth" in predictions
-            and "tracks" in batch
+            and has_tracks
         ):
             plane_loss = compute_plane_rigidity_loss(predictions, batch, **self.plane_rigidity)
             if plane_loss is not None:
@@ -984,28 +985,140 @@ def compute_reprojection_loss(predictions, batch, weight=1.0, **kwargs):
     return total_loss / n_valid
 
 
-def compute_plane_rigidity_loss(predictions, batch, weight=1.0, min_visible_frames=2, **kwargs):
+def _render_plane_fitting_figure(world_pts_f32, normals, offsets):
+    """
+    Render a 3D scatter plot of unprojected world points per frame and the
+    mean fitted plane as a semi-transparent surface.
+
+    Uses the first batch element only. Intended for TensorBoard image logging.
+
+    Args:
+        world_pts_f32 : (B, S, N, 3) float32 world-space points
+        normals       : (B, S, 3)    per-frame plane normals (sign-aligned)
+        offsets       : (B, S)       per-frame plane offsets
+
+    Returns:
+        (3, H, W) uint8 tensor suitable for tb_writer.log_visuals
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    pts   = world_pts_f32[0].detach().cpu().numpy()   # S, N, 3
+    norms = normals[0].detach().cpu().numpy()          # S, 3
+    offs  = offsets[0].detach().cpu().numpy()          # S
+
+    S = pts.shape[0]
+    fig = plt.figure(figsize=(8, 6))
+    ax  = fig.add_subplot(111, projection='3d')
+
+    colors = plt.cm.rainbow(np.linspace(0, 1, S))
+    for i in range(S):
+        ax.scatter(pts[i, :, 0], pts[i, :, 1], pts[i, :, 2],
+                   c=[colors[i]], alpha=0.4, s=4, label=f'f{i}')
+
+    # Mean fitted plane
+    n_mean = norms.mean(axis=0)
+    n_norm = np.linalg.norm(n_mean)
+    if n_norm > 1e-6:
+        n_mean /= n_norm
+    centroid = pts.reshape(-1, 3).mean(axis=0)
+
+    # Two orthogonal vectors spanning the plane
+    u  = np.array([1.0, 0.0, 0.0]) if abs(n_mean[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    v1 = np.cross(n_mean, u);  v1 /= (np.linalg.norm(v1) + 1e-8)
+    v2 = np.cross(n_mean, v1); v2 /= (np.linalg.norm(v2) + 1e-8)
+
+    extent = float(np.ptp(pts.reshape(-1, 3), axis=0).max()) * 0.5
+    g = np.linspace(-extent, extent, 12)
+    g1, g2 = np.meshgrid(g, g)
+    plane   = centroid + g1[..., None] * v1 + g2[..., None] * v2
+    ax.plot_surface(plane[..., 0], plane[..., 1], plane[..., 2],
+                    alpha=0.15, color='gray')
+
+    # Normal arrow from centroid
+    ax.quiver(*centroid, *(n_mean * extent * 0.4),
+              color='red', linewidth=2, arrow_length_ratio=0.2)
+
+    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+    if S <= 16:
+        ax.legend(fontsize=5, loc='upper right', markerscale=2)
+    ax.set_title('Plane fitting — world pts per frame', fontsize=9)
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+    plt.close(fig)
+
+    return torch.from_numpy(img.copy()).permute(2, 0, 1)  # 3, H, W  uint8
+
+
+def _fit_plane_svd(pts):
+    """
+    Fit a plane to a batch of 3D points using SVD.
+
+    Args:
+        pts : (B, N, 3) float32 — world-space points
+
+    Returns:
+        normal : (B, 3) unit normal vector (direction of smallest variance)
+        offset : (B,)  plane offset d such that n · x = d for points on the plane
+    """
+    centroid = pts.mean(dim=1, keepdim=True)              # B, 1, 3
+    centered = pts - centroid                              # B, N, 3
+    # SVD: centered = U @ diag(S) @ Vh
+    # The normal is the right singular vector for the smallest singular value (last row of Vh)
+    _, _, Vh = torch.linalg.svd(centered, full_matrices=False)  # Vh: B, 3, 3
+    normal = Vh[:, 2, :]                                   # B, 3
+    normal = F.normalize(normal, dim=-1)
+    offset = (centroid.squeeze(1) * normal).sum(dim=-1)    # B
+    return normal, offset
+
+
+def compute_plane_rigidity_loss(
+    predictions,
+    batch,
+    weight=1.0,
+    consistency_weight=1.0,
+    plane_weight=0.0,
+    min_visible_frames=2,
+    visualize=False,
+    **kwargs,
+):
     """
     Self-supervised cross-frame 3D consistency loss for rigid plane tracks.
 
-    The GT tracks lie on a rigid plane (the AE logo). Unprojecting each track
-    using the predicted depth and predicted camera for that frame should yield
-    the same world-space 3D point regardless of which frame is used.
+    Two complementary terms, each independently weighted:
 
-    Loss = mean variance of the unprojected world points across frames, per track.
-           Zero iff every frame's (depth, camera) pair agrees on the same 3D point.
+    1. Point consistency (consistency_weight):
+       Per-track: the L2 distance of each frame's unprojected 3D position from
+       the cross-frame mean. Zero iff every (depth, camera) pair agrees on the
+       same 3D world point for each track.
+
+    2. Plane fitting (plane_weight):
+       For each frame, fit a plane to all N unprojected world points via SVD.
+       Loss = normal-direction variance + offset variance across frames.
+       Captures systematic errors (wrong rotation, wrong depth scale) that the
+       per-point term may miss. SVD computed in float32 for numerical stability.
 
     Gradient flows jointly through depth head and camera head — no external labels.
 
     Args:
-        predictions : dict with "pose_enc_list" (list of B,S,9) and "depth" (B,S,H,W,1)
-        batch       : dict with "tracks" (B,S,N,2) and "track_vis_mask" (B,S,N bool)
-        weight      : scalar (absorbed by caller, kept for **kwargs compat)
-        min_visible_frames : minimum number of frames a track must be visible in
-                             to contribute to the loss (need ≥2 to compute variance)
+        predictions        : dict with "pose_enc_list" (list of B,S,9) and "depth" (B,S,H,W,1)
+        batch              : dict with "tracks" (B,S,N,2) and "track_vis_mask" (B,S,N bool)
+        weight             : overall scalar weight (absorbed by caller)
+        consistency_weight : weight for the point consistency term (0.0 to disable)
+        plane_weight       : weight for the plane fitting term (0.0 to disable)
+        min_visible_frames : track must be visible in ≥ this many frames to contribute
+        visualize          : if True and plane_weight > 0, also return a (3,H,W) uint8
+                             TensorBoard image of the fitted plane. Adds matplotlib
+                             overhead — only set True at logging frequency.
 
     Returns:
-        Scalar loss tensor, or None if no valid tracks.
+        loss scalar (or None if no valid tracks) when visualize=False.
+        (loss, vis_image | None) tuple when visualize=True.
     """
     if "tracks" not in batch or batch["tracks"] is None:
         return None
@@ -1033,9 +1146,19 @@ def compute_plane_rigidity_loss(predictions, batch, weight=1.0, min_visible_fram
         pred_depth_i = predictions["depth"][:, i, :, :, 0]  # B, H, W
         track_i      = gt_tracks[:, i, :, :]                 # B, N, 2
 
+        # For invisible tracks in frame i, clamp coordinates to image bounds so
+        # grid_sample doesn't receive out-of-range values and return zero depth,
+        # which would produce garbage cam_pts. The resulting world_i for invisible
+        # tracks is excluded from the loss via loss_mask anyway.
+        vis_i  = gt_vis[:, i, :]                             # B, N
+        safe_u = track_i[..., 0].clamp(0, W - 1)
+        safe_v = track_i[..., 1].clamp(0, H - 1)
+        safe_u = torch.where(vis_i, track_i[..., 0], safe_u)
+        safe_v = torch.where(vis_i, track_i[..., 1], safe_v)
+
         # Bilinear sample of predicted depth at track positions
-        norm_u = (track_i[..., 0] / (W - 1)) * 2.0 - 1.0   # B, N
-        norm_v = (track_i[..., 1] / (H - 1)) * 2.0 - 1.0   # B, N
+        norm_u = (safe_u / (W - 1)) * 2.0 - 1.0             # B, N
+        norm_v = (safe_v / (H - 1)) * 2.0 - 1.0             # B, N
         grid   = torch.stack([norm_u, norm_v], dim=-1).unsqueeze(1)  # B, 1, N, 2
         depth_i = F.grid_sample(
             pred_depth_i.unsqueeze(1),
@@ -1048,9 +1171,9 @@ def compute_plane_rigidity_loss(predictions, batch, weight=1.0, min_visible_fram
         fy  = Ki[:, 1, 1].clamp(min=1e-2)                   # B
         cx  = Ki[:, 0, 2]                                    # B
         cy  = Ki[:, 1, 2]                                    # B
-        x_c = (track_i[..., 0] - cx.unsqueeze(1)) / fx.unsqueeze(1) * depth_i  # B, N
-        y_c = (track_i[..., 1] - cy.unsqueeze(1)) / fy.unsqueeze(1) * depth_i  # B, N
-        cam_pts_i = torch.stack([x_c, y_c, depth_i], dim=-1)                   # B, N, 3
+        x_c = (safe_u - cx.unsqueeze(1)) / fx.unsqueeze(1) * depth_i  # B, N
+        y_c = (safe_v - cy.unsqueeze(1)) / fy.unsqueeze(1) * depth_i  # B, N
+        cam_pts_i = torch.stack([x_c, y_c, depth_i], dim=-1)          # B, N, 3
 
         # Transform to world space: P_world = R^T @ (P_cam - t)
         Ei = pred_extrinsics[:, i, :, :]                     # B, 3, 4
@@ -1064,23 +1187,90 @@ def compute_plane_rigidity_loss(predictions, batch, weight=1.0, min_visible_fram
     # Stack across frames: (B, S, N, 3)
     world_pts = torch.stack(world_pts_list, dim=1)
 
-    # Visibility-masked mean world position per track across frames
-    vis_f   = gt_vis.unsqueeze(-1).float()                   # B, S, N, 1
-    vis_sum = vis_f.sum(dim=1).clamp(min=1.0)               # B, N, 1
-    world_mean = (world_pts * vis_f).sum(dim=1) / vis_sum    # B, N, 3
-
-    # Squared distance of each frame's unproject from the cross-frame mean
-    diff   = world_pts - world_mean.unsqueeze(1)             # B, S, N, 3
-    sq_dist = (diff * diff).sum(dim=-1)                      # B, S, N
-
     # Mask: frame must be visible AND track must appear in enough frames
     loss_mask = gt_vis & valid_tracks.unsqueeze(1)           # B, S, N
     if not loss_mask.any():
         return None
 
-    loss = sq_dist[loss_mask].mean()
-    loss = check_and_fix_inf_nan(loss, "plane_rigidity_loss", hard_max=100.0)
-    return loss
+    total_loss = world_pts.new_zeros(1).squeeze()
+
+    # -------------------------------------------------------------------------
+    # Term 1 — Point consistency
+    # Per-track L2 distance from the cross-frame mean world position.
+    # -------------------------------------------------------------------------
+    if consistency_weight > 0.0:
+        vis_f      = gt_vis.unsqueeze(-1).float()            # B, S, N, 1
+        vis_sum    = vis_f.sum(dim=1).clamp(min=1.0)         # B, N, 1
+        world_mean = (world_pts * vis_f).sum(dim=1) / vis_sum  # B, N, 3
+
+        diff    = world_pts - world_mean.unsqueeze(1)        # B, S, N, 3
+        l2_dist = (diff * diff).sum(dim=-1).clamp(min=0).sqrt()  # B, S, N
+
+        consistency_loss = l2_dist[loss_mask].mean()
+        consistency_loss = check_and_fix_inf_nan(
+            consistency_loss, "plane_consistency_loss", hard_max=100.0
+        )
+        total_loss = total_loss + consistency_weight * consistency_loss
+
+    # -------------------------------------------------------------------------
+    # Term 2 — Plane fitting
+    # For each frame, fit a plane via SVD to its N world points.
+    # Loss = variance of plane normals + variance of plane offsets across frames.
+    # Captures systematic errors (wrong rotation, wrong depth scale) that the
+    # per-point term may miss.
+    # SVD is computed in float32 — bfloat16 SVD backward is numerically unstable.
+    # -------------------------------------------------------------------------
+    if plane_weight > 0.0:
+        world_pts_f32 = world_pts.float()                    # B, S, N, 3 in float32
+
+        normals_list = []
+        offsets_list = []
+        for i in range(S):
+            n_i, d_i = _fit_plane_svd(world_pts_f32[:, i, :, :])  # B,3 and B
+            normals_list.append(n_i)
+            offsets_list.append(d_i)
+
+        normals = torch.stack(normals_list, dim=1)           # B, S, 3
+        offsets = torch.stack(offsets_list, dim=1)           # B, S
+
+        # Resolve sign ambiguity: flip normals that point opposite to frame 0.
+        # This ensures all normals describe the same side of the plane before
+        # computing variance.
+        dot     = (normals * normals[:, :1, :]).sum(dim=-1)  # B, S
+        signs   = dot.sign()
+        signs   = torch.where(signs == 0, torch.ones_like(signs), signs)
+        normals = normals * signs.unsqueeze(-1)              # B, S, 3
+        offsets = offsets * signs                            # B, S
+
+        # Normal variance: 1 - cos^2(angle to mean normal).
+        # Zero when all normals are identical; max 1 when orthogonal.
+        n_mean        = F.normalize(normals.mean(dim=1), dim=-1)  # B, 3
+        cos_sim       = (normals * n_mean.unsqueeze(1)).sum(dim=-1)  # B, S
+        normal_var    = (1.0 - cos_sim.pow(2)).mean()
+
+        # Offset variance: mean squared deviation from the mean offset.
+        d_mean        = offsets.mean(dim=1, keepdim=True)    # B, 1
+        offset_var    = (offsets - d_mean).pow(2).mean()
+
+        plane_loss = normal_var + offset_var
+        plane_loss = check_and_fix_inf_nan(
+            plane_loss.to(world_pts.dtype), "plane_fitting_loss", hard_max=100.0
+        )
+        total_loss = total_loss + plane_weight * plane_loss
+
+        # Render visualization — only when requested, adds matplotlib overhead
+        if visualize:
+            vis_image = _render_plane_fitting_figure(world_pts_f32, normals, offsets)
+        else:
+            vis_image = None
+    else:
+        vis_image = None
+
+    total_loss = check_and_fix_inf_nan(total_loss, "plane_rigidity_loss", hard_max=100.0)
+
+    if visualize:
+        return total_loss, vis_image
+    return total_loss
 
 
 def reduce_masked_mean(x, mask, dim=None, keepdim=False):
@@ -1133,5 +1323,3 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
         flow_loss = flow_loss / n_predictions
 
     return flow_loss
-
-

@@ -162,9 +162,11 @@ loss:
   reproj: null
 
   plane_rigidity:
-    weight: 0.1             # Start conservative — plane rigidity loss is in squared world-unit space
-                            # (normalised scene scale ~1), so 0.1 keeps it on par with track loss ~0.06
-    min_visible_frames: 2   # Minimum frames a track must appear in to contribute (need ≥2 for variance)
+    weight: 0.1              # Overall scale — multiplied onto the combined term below
+    consistency_weight: 1.0  # Term 1: per-track L2 distance from cross-frame mean world position
+    plane_weight: 0.1        # Term 2: SVD plane fit per frame — normal + offset variance across frames
+                             # Start small: SVD gradients can be large when points are near-coplanar
+    min_visible_frames: 2    # Track must be visible in ≥2 frames to contribute (need variance)
 
 
 optim:
