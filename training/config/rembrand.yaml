@@ -14,8 +14,8 @@ patch_size: 14
 val_epoch_freq: 5
 max_img_per_gpu: 48   # floor(48/S) = batch_size. S=24 → bs=2, S=8 → bs=6.
 
-limit_train_batches: 50    # ceil(83 train seqs / floor(48/16)) = ceil(83/3) = 28 — one full pass per epoch
-limit_val_batches:   20     # ceil(20 val seqs   / floor(48/12)) = ceil(20/4) = 5  [val avg_img=12 from [8,16]]
+limit_train_batches: 50    # ceil(114 train seqs / floor(48/16)) = ceil(114/3) = 38 — one full pass per epoch
+limit_val_batches:   20     # ceil(26 val seqs   / floor(48/12)) = ceil(26/4) = 7  [val avg_img=12 from [8,16]]
 
 
 data:
@@ -64,9 +64,9 @@ data:
       dataset_configs:
         - _target_: data.datasets.colmap.ColmapDataset
           split: train
-          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/
+          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/
           depth_dir_name: depth
-          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/train_split.txt  # direct file path (one seq name per line)
+          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/train_split.txt  # direct file path (one seq name per line)
 
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
@@ -106,9 +106,9 @@ data:
       dataset_configs:
         - _target_: data.datasets.colmap.ColmapDataset
           split: val
-          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/
+          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/
           depth_dir_name: depth
-          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_sample_dataset/val_split.txt
+          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/val_split.txt
 
 
 logging:
