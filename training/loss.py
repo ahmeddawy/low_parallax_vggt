@@ -24,7 +24,7 @@ class MultitaskLoss(torch.nn.Module):
     - Point loss
     - Tracking loss
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, reproj=None, plane_rigidity=None, **kwargs):
+    def __init__(self, camera=None, depth=None, point=None, track=None, reproj=None, plane_rigidity=None, depth_consistency=None, **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
@@ -33,6 +33,7 @@ class MultitaskLoss(torch.nn.Module):
         self.track = track
         self.reproj = reproj
         self.plane_rigidity = plane_rigidity
+        self.depth_consistency = depth_consistency
 
     def forward(self, predictions, batch, visualize=False) -> torch.Tensor:
         """
@@ -131,6 +132,18 @@ class MultitaskLoss(torch.nn.Module):
                 loss_dict["loss_plane_rigidity"] = plane_loss
             if vis_image is not None:
                 loss_dict["vis_plane_fitting"] = vis_image
+
+        # Depth track consistency — Pearson correlation of depth at GT track positions across frames
+        if (
+            self.depth_consistency is not None
+            and "depth" in predictions
+            and predictions["depth"] is not None
+            and has_tracks
+        ):
+            dc_loss = compute_depth_track_consistency_loss(predictions, batch, **self.depth_consistency)
+            if dc_loss is not None:
+                total_loss = total_loss + dc_loss * self.depth_consistency.get("weight", 1.0)
+                loss_dict["loss_depth_consistency"] = dc_loss
 
         loss_dict["objective"] = total_loss
 
@@ -1346,3 +1359,96 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
         flow_loss = flow_loss / n_predictions
 
     return flow_loss
+
+
+def compute_depth_track_consistency_loss(predictions, batch, weight=1.0, min_shared=4, **kwargs):
+    """
+    Depth consistency at GT track positions across frame pairs.
+
+    For every pair of frames (i, j) sharing >= min_shared visible tracks,
+    computes the Pearson correlation between predicted depths sampled at
+    those track positions across frames. Loss = 1 - corr, averaged over
+    all valid pairs.
+
+    Scale- and shift-invariant: does not require absolute depth values or
+    camera predictions. Directly penalises temporal depth inconsistency
+    introduced by aggregator drift during track fine-tuning.
+
+    Args:
+        predictions : dict with "depth" (B, S, H, W, 1)
+        batch       : dict with "tracks" (B, S, N, 2) and "track_vis_mask" (B, S, N)
+        weight      : scalar weight (absorbed by caller)
+        min_shared  : min shared visible tracks required to include a frame pair
+
+    Returns:
+        Scalar loss or None if no valid pairs found.
+    """
+    if "tracks" not in batch or batch["tracks"] is None:
+        return None
+    if "depth" not in predictions or predictions["depth"] is None:
+        return None
+
+    gt_tracks = batch["tracks"]         # B, S, N, 2
+    gt_vis    = batch["track_vis_mask"] # B, S, N
+    B, S, N, _ = gt_tracks.shape
+    H, W = batch["images"].shape[-2:]
+
+    # --- Sample predicted depth at GT track positions for all frames ---
+    sampled = []
+    for i in range(S):
+        depth_i = predictions["depth"][:, i, :, :, 0]   # B, H, W
+        track_i = gt_tracks[:, i, :, :]                  # B, N, 2
+        norm_u  = (track_i[..., 0] / (W - 1)) * 2.0 - 1.0
+        norm_v  = (track_i[..., 1] / (H - 1)) * 2.0 - 1.0
+        grid    = torch.stack([norm_u, norm_v], dim=-1).unsqueeze(1)  # B, 1, N, 2
+        d = F.grid_sample(
+            depth_i.unsqueeze(1), grid,
+            mode="bilinear", align_corners=True,
+        ).squeeze(1).squeeze(1)   # B, N
+        sampled.append(d)
+
+    depths = torch.stack(sampled, dim=1)   # B, S, N
+
+    # --- Pearson correlation for every (i, j) frame pair ---
+    total_loss = depths.new_zeros(1).squeeze()
+    n_pairs = 0
+
+    for i in range(S):
+        for j in range(i + 1, S):
+            shared   = gt_vis[:, i, :] & gt_vis[:, j, :]   # B, N
+            n_shared = shared.float().sum(dim=-1)            # B
+
+            valid_b = n_shared >= min_shared
+            if not valid_b.any():
+                continue
+
+            mask = shared.float()   # B, N
+
+            d_i = depths[:, i, :]   # B, N
+            d_j = depths[:, j, :]   # B, N
+
+            # Weighted mean over shared visible tracks
+            denom  = n_shared.clamp(min=1).unsqueeze(-1)     # B, 1
+            mean_i = (d_i * mask).sum(dim=-1, keepdim=True) / denom  # B, 1
+            mean_j = (d_j * mask).sum(dim=-1, keepdim=True) / denom  # B, 1
+
+            # Centred, masked
+            di_c = (d_i - mean_i) * mask   # B, N
+            dj_c = (d_j - mean_j) * mask   # B, N
+
+            cov   = (di_c * dj_c).sum(dim=-1)                         # B
+            std_i = di_c.pow(2).sum(dim=-1).add(1e-6).sqrt()          # B
+            std_j = dj_c.pow(2).sum(dim=-1).add(1e-6).sqrt()          # B
+
+            corr      = (cov / (std_i * std_j)).clamp(-1.0, 1.0)      # B
+            pair_loss = (1.0 - corr)[valid_b].mean()
+            pair_loss = check_and_fix_inf_nan(
+                pair_loss, f"depth_consistency_{i}_{j}", hard_max=2.0
+            )
+            total_loss = total_loss + pair_loss
+            n_pairs   += 1
+
+    if n_pairs == 0:
+        return None
+
+    return total_loss / n_pairs
