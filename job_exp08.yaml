@@ -1,0 +1,65 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: dawy-vggt-exp08-
+  labels:
+    jobgroup: dawy-gpu-a100-8x-jobgroup
+    experiment: exp08
+spec:
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: research
+          image: us-central1-docker.pkg.dev/rembrand-ai/rembrand-repo/vggt-training:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              eval '/usr/sbin/sshd -D &'
+              git clone https://github.com/ahmeddawy/low_parallax_vggt.git /workspace/vggt
+              cd /workspace/vggt && git checkout plane-rigidity
+              pip install -e /workspace/vggt -q
+              # Download pretrained VGGT-1B checkpoint
+              mkdir -p /workspace/low_parallax_vggt
+              wget -q -O /workspace/low_parallax_vggt/model.pt \
+                "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+              # Run training from inside training/ (Hydra config discovery)
+              cd /workspace/vggt/training
+              torchrun --nproc_per_node=8 launch.py --config rembrand_exp08
+              echo "=== Training finished or crashed — pod staying alive for inspection ==="
+              sleep infinity
+          volumeMounts:
+            - mountPath: /mnt/bucket
+              name: bucket
+            - mountPath: /mnt/nfs
+              name: volume
+            - mountPath: /dev/shm
+              name: dshm
+          ports:
+            - name: ssh
+              containerPort: 22
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 80
+              memory: 1200Gi
+              nvidia.com/gpu: 8
+      nodeSelector:
+        cloud.google.com/gke-nodepool: gpu-nodes-a100-80gb-8x-flex
+        cloud.google.com/gke-flex-start: "true"
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      serviceAccountName: gke-node-k8s-sa
+      volumes:
+        - name: volume
+          persistentVolumeClaim:
+            claimName: diffusion
+        - name: bucket
+          persistentVolumeClaim:
+            claimName: gcs-fuse-csi-static-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
