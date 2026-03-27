@@ -177,3 +177,229 @@ Proposed supervision (EXP-03):
   plane_rigidity  : weight=TBD   (new, to be implemented)
 
 ================================================================================
+
+================================================================================
+NEW DATASET — tracking_whisper_clean_dataset
+================================================================================
+
+All experiments from EXP-03 onward use:
+  Dataset : tracking_whisper_clean_dataset
+            114 train seqs / 26 val seqs, 1920x1080, 16:9, AE plane tracks
+  Branch  : plane-rigidity (ahmeddawy/low_parallax_vggt)
+  limit_train_batches=50, limit_val_batches=20
+  STEPS_PER_EPOCH = 50
+
+--------------------------------------------------------------------------------
+EXP-03a  rembrand_lora_r16_plane_rigidity_v1
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.0, depth.weight=0.1, track.weight=1.0,
+          plane_rigidity.weight=0.1, consistency_weight=1.0, plane_weight=0.0
+          track.max_norm=1.0, depth.max_norm=0.5, camera.max_norm=0.5
+          aggregator.max_norm=1.0
+Epochs  : ~16 (killed)
+
+Training dynamics (observed ep1-16):
+  train/loss_track        : ~0.22 (E0) -> 0.178 (E16, stalled)
+  val/loss_track          : 0.174 (E16)
+  train/loss_conf_depth   : +0.18 (E0) -> -2.12 (E16, collapse)
+  train/loss_plane_rig    : ~0.014 (very quiet — <0.14% of objective)
+  Grad/track (pre-clip)   : 12-25 (HIGH throughout)
+  Grad/depth (pre-clip)   : 7.7 (HIGH)
+
+Root causes diagnosed:
+  1. CONFIDENCE EXPLOIT: loss_conf_depth collapsed +0.18 → -2.12
+     The Kendall uncertainty loss gamma*loss_reg*conf - alpha*log(conf)
+     created a runaway: better predictions → higher optimal conf →
+     more negative loss → incentive for even better predictions.
+     With loss_reg~0.05, alpha=1.0, gamma=1.0: minimum = 1+log(0.05) ≈ -2.0.
+  2. GRAD/TRACK BLOWTHROUGH: pre-clip norm 12-25 with max_norm=1.0.
+     Clip was firing but gradient still large, causing periodic loss_track
+     spikes to 1.3-1.6.
+  3. RIGIDITY TOO QUIET: loss_plane_rigidity~0.014 × weight=0.1 = 0.0014
+     contribution to objective. Depth confidence exploit dominated.
+
+Action: KILLED at ep16. Launched EXP-04 with fixes.
+
+--------------------------------------------------------------------------------
+EXP-03b  rembrand_lora_r16_plane_rigidity_v2
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.0, depth.weight=0.1, track.weight=1.0,
+          plane_rigidity.weight=0.3, consistency_weight=1.0, plane_weight=1.0
+          (SVD plane fitting ENABLED — this is the key difference from 03a)
+          track.max_norm=1.0, depth.max_norm=0.5, camera.max_norm=0.5
+Epochs  : ~16 (killed)
+
+Training dynamics (observed ep1-16):
+  train/loss_track        : ~0.26 (E0) -> 0.268 (E16, worse than 03a)
+  val/loss_track          : 0.164 (E16, similar to 03a)
+  train/loss_conf_depth   : +0.18 (E0) -> -0.96 (E16, collapse, slower than 03a)
+  train/loss_plane_rig    : ~0.017 (slightly more active than 03a)
+  Grad/track (pre-clip)   : 11.6 (HIGH)
+  Grad/camera (pre-clip)  : occasional spikes to 251 (SVD plane fitting)
+
+Root causes diagnosed:
+  Same confidence exploit as 03a (milder due to weight=0.3 diluting depth term).
+  SVD plane fitting caused Grad/camera spikes to 251 on near-coplanar batches.
+  Wide train/val gap (0.268 vs 0.164) indicates training instability.
+
+Action: KILLED at ep16. SVD plane fitting (plane_weight) confirmed dangerous.
+
+Key fixes identified for EXP-04:
+  - Remove depth entirely (depth: null) to kill confidence exploit at root
+  - Tighten track.max_norm: 1.0 → 0.3
+  - Raise plane_rigidity.weight: 0.1/0.3 → 0.3
+  - Keep plane_weight=0.0 (SVD disabled)
+
+--------------------------------------------------------------------------------
+EXP-04  rembrand_lora_r16_plane_rigidity_v3  [RUNNING]
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.0, depth=null, track.weight=1.0,
+          plane_rigidity.weight=0.3, consistency_weight=1.0, plane_weight=0.0
+          track.max_norm=0.3, depth.max_norm=0.5, camera.max_norm=0.5
+          aggregator.max_norm=1.0
+Dataset : tracking_whisper_clean_dataset
+
+Training dynamics (observed ep0-6):
+  train/loss_track        : 0.22 (E0) -> 0.158 (E6, converging)
+  val/loss_track          : 0.104 (E2, first val run) — BEATS ep5 target of 0.12
+  train/loss_plane_rig    : 0.034 (E0) -> 0.001 (E6, converged to near zero)
+  val/loss_plane_rig      : 0.010 (stable)
+  Grad/track (pre-clip)   : 18.9 (E2) -> 30.5 (E4, spike) -> 4.1 (E6, recovering)
+  Grad/depth              : ~0.000 — confirms depth=null working, depth head dormant
+  Grad/camera             : ~0.001-0.005 — very low, rigidity too weak for 3D signal
+
+Notable events:
+  E4: Grad/track spike to 30.5 (transient). train/loss_track rose to 0.380.
+      Self-corrected by E6 (Grad/track 4.1, train loss 0.158).
+  Val ep5 pending: ep2 val frozen at 0.104. Awaiting ep5 val flush.
+
+Current issue:
+  loss_plane_rigidity ~0.001 × weight=0.3 = 0.0003 objective contribution (0.04%).
+  Depth/camera heads receiving essentially zero gradient from rigidity.
+  Grad/depth=0.000 confirms no 3D self-supervision signal reaching depth head.
+  3D improvement NOT happening — rigidity is too weak.
+
+Code fix applied during this run:
+  training/loss.py line 445: loss_reg.detach() in confidence term.
+  (Fix was for EXP-05, not needed for EXP-04 since depth=null, but committed
+  to protect future experiments with depth enabled.)
+
+--------------------------------------------------------------------------------
+EXP-05  rembrand_lora_r16_no_reproj_newdata  [RESTARTED — fixed pod running]
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.5, depth.weight=0.5, track.weight=1.0, reproj=null
+          (EXP-01 reproduction on tracking_whisper_clean_dataset)
+          depth.max_norm=0.5, camera.max_norm=0.5, track.max_norm=1.0
+          (confidence exploit fix applied: loss_reg.detach() in regression_loss)
+Dataset : tracking_whisper_clean_dataset
+
+First run (OLD pod — dawy-vggt-exp05-tqmft-8hlbh):
+  Launched with OLD code (confidence exploit NOT fixed).
+  train/loss_conf_depth   : +0.45 (E0) -> -0.135 (E1) -> -0.680 (E2) -> -1.231 (E2+)
+  Grad/depth              : 3.4 (E1) -> 22.3 (E2) — exploding
+  Grad/track              : 20.7 (E2)
+  KILLED at ep~3: identical failure mode to EXP-03a/03b.
+
+Root cause confirmed:
+  Kendall uncertainty loss exploit: loss_conf_depth → -1.23 by ep2.
+  Pattern now observed 4/4 times across all experiments with depth enabled.
+  The exploit appears regardless of depth weight (0.1 in EXP-03, 0.5 here).
+  Structural fix needed in loss.py.
+
+Code fix (training/loss.py):
+  Detach loss_reg in confidence term:
+    BEFORE: loss_conf = gamma * loss_reg * conf[mask] - alpha * torch.log(conf[mask])
+    AFTER:  loss_conf = gamma * loss_reg.detach() * conf[mask] - alpha * torch.log(conf[mask])
+  Effect: breaks circular exploit. Confidence head tracks prediction quality
+          (via detached loss_reg) without feeding back into prediction head.
+          Prediction head still trains via loss_reg_depth (returned separately).
+  Committed: d4027b7 "Fix confidence exploit: detach loss_reg in confidence term"
+
+Second run (NEW pod — dawy-vggt-exp05-tqmft-fqmtc):
+  Launched with FIXED code.
+  train/loss_conf_depth   : +0.093 (step 7) — POSITIVE, fix confirmed working
+  Grad/depth              : 3.85 (normal for depth.weight=0.5)
+  Status: step 7, too early to draw conclusions. Monitoring.
+
+--------------------------------------------------------------------------------
+EXP-04b  rembrand_lora_r16_plane_rigidity_v4  [CONFIG READY — not launched]
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.0, depth=null, track.weight=0.5,
+          plane_rigidity.weight=1.0, consistency_weight=1.0, plane_weight=0.0
+          track.max_norm=0.1, depth.max_norm=0.5, camera.max_norm=0.5
+          aggregator.max_norm=0.5
+Dataset : tracking_whisper_clean_dataset
+
+Motivation (from EXP-04 analysis):
+  EXP-04's 3D self-supervision was not working because:
+  - Rigidity at 0.001×0.3 = 0.04% of objective → inaudible to depth/camera
+  - Grad/depth=0.000 confirmed no gradient reaching depth/camera from rigidity
+  - Track dominated at 1.0 weight, rigidity could not compete
+
+Changes vs EXP-04:
+  plane_rigidity.weight : 0.3 → 1.0  (rigidity becomes first-class signal)
+  track.weight          : 1.0 → 0.5  (reduce track dominance, let rigidity compete)
+  track.max_norm        : 0.3 → 0.1  (pre-clip norm 9-30 → apply 0.1 step, reduce spikes)
+  aggregator.max_norm   : 1.0 → 0.5  (tighter backbone under increased rigidity gradient)
+
+Expected signals confirming 3D supervision is working:
+  - loss_plane_rigidity (train) should rise: 0.001 → 0.005-0.020
+  - Grad/depth > 0.1 (rigidity backprop reaching depth head)
+  - Grad/camera > 0.05 (rigidity backprop reaching camera head)
+  - val/loss_track should hold ≤ 0.15 (track weight halved but signal still strong)
+
+Config committed: acc947b "Add EXP-04b config: rebalanced weights for 3D self-supervision"
+
+================================================================================
+BUGS FOUND AND FIXED
+================================================================================
+
+1. TensorBoard visualization — val_epoch_viz_done flag (trainer.py)
+   Bug: should_viz used self.steps["val"]==0, which is cumulative — only fired
+        once at the very first val batch of the entire training run.
+   Fix: Added _val_epoch_viz_done flag, reset in val_epoch() before loop,
+        checked in _step(). Plane fitting image now logged every val epoch.
+
+2. TB plane fitting image logged at wrong step (trainer.py)
+   Bug: _log_plane_fitting_visual used self.steps["val"] (always 0 for first
+        batch) — every val epoch overwrote step 0 in TB.
+   Fix: Log at self.epoch so TB slider shows ep5, ep10, ep15...
+
+3. TensorBoard showing only 10 steps (tb_writer.py)
+   Bug: new_style=True writes scalars as tensor-type events. TB default
+        size_guidance for tensors=10, so only 10 of N steps loaded in UI.
+   Fix: Launch TB with --samples_per_plugin scalars=0, or parse with
+        EventAccumulator(dir, size_guidance={"tensors": 0}).
+
+4. GCSFuse ESTALE errno=116 (tb_writer.py)
+   Bug: GCSFuse atomically replaces the GCS object on each flush.
+        SummaryWriter holds a file handle that becomes stale (ESTALE).
+   Fix: Added errno.ESTALE catch in TensorBoardLogger.log(), with
+        _recreate_writer() fallback using a new UUID filename suffix.
+
+5. Confidence exploit in Kendall uncertainty loss (loss.py)
+   Bug: loss_conf = gamma*loss_reg*conf - alpha*log(conf) creates a circular
+        exploit. Better predictions → higher optimal conf → more negative loss
+        → incentive for better predictions. Observed as loss_conf_depth → -2.8
+        across 4/4 experiments with depth enabled (EXP-01, EXP-03a, EXP-03b,
+        EXP-05 old pod).
+   Fix: loss_conf = gamma*loss_reg.detach()*conf - alpha*log(conf).
+        Confidence head tracks prediction quality without feeding back.
+        Prediction head still trains via loss_reg_depth (separate objective term).
+   Commit: d4027b7
+
+================================================================================
+QUANTITATIVE SUMMARY (all experiments, val/loss_track)
+================================================================================
+
+                        val/loss_track    val/3D_reproj_ATE   status
+  vanilla VGGT          —                 1.74px              baseline
+  EXP-01 (ep95)         0.063             5.78px (+232%)      done
+  EXP-02 (ep95)         0.056             238.89px (+13627%)  done (catastrophic 3D)
+  EXP-03a (ep16)        0.174             —                   killed (conf exploit)
+  EXP-03b (ep16)        0.164             —                   killed (conf exploit + SVD)
+  EXP-04 (ep2 val)      0.104             —                   running (~ep6)
+  EXP-05 (new pod)      —                 —                   running (step 7)
+  EXP-04b               —                 —                   config ready
+
+================================================================================
