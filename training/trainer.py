@@ -517,6 +517,8 @@ class Trainer:
             else self.limit_val_batches
         )
 
+        self._val_epoch_viz_done = False  # reset so _step fires viz on first batch of this run
+
         for data_iter, batch in enumerate(val_loader):
             if data_iter > limit_val_batches:
                 break
@@ -829,11 +831,15 @@ class Trainer:
         # Loss computation.
         # Visualize plane fitting on the first step of every val epoch (rank 0 only).
         # Adds matplotlib overhead so is gated strictly to avoid slowing down training.
+        # _val_epoch_viz_done is reset to False at the start of each val_epoch loop so
+        # this fires exactly once per val run (not just once at global step 0).
         should_viz = (
             self.rank == 0
             and phase == "val"
-            and self.steps[phase] == 0
+            and not getattr(self, "_val_epoch_viz_done", True)
         )
+        if should_viz:
+            self._val_epoch_viz_done = True
         loss_dict = self.loss(y_hat, batch, visualize=should_viz)
 
         # Combine all data for logging
@@ -841,7 +847,9 @@ class Trainer:
 
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
         self._log_tb_visuals(log_data, phase, self.steps[phase])
-        self._log_plane_fitting_visual(loss_dict, phase, self.steps[phase])
+        # Log at self.epoch so the TensorBoard image slider shows ep5, ep10, ep15 ...
+        # instead of all runs collapsing to val-batch-step 0.
+        self._log_plane_fitting_visual(loss_dict, phase, self.epoch)
 
         self.steps[phase] += 1
         return loss_dict

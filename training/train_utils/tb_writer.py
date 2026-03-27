@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import atexit
+import errno
 import logging
 import uuid
 from typing import Any, Dict, Optional, Union
@@ -95,6 +96,19 @@ class TensorBoardLogger:
         for key, value in payload.items():
             self.log(key, value, step)
 
+    def _recreate_writer(self) -> None:
+        """Close stale writer and open a fresh one (new event file)."""
+        try:
+            if self._writer:
+                self._writer.close()
+        except Exception:
+            pass
+        self._writer = SummaryWriter(
+            log_dir=self._path,
+            filename_suffix=str(uuid.uuid4()),
+        )
+        logging.warning("TensorBoardLogger: recreated writer after stale file handle")
+
     def log(self, name: str, data: Any, step: int) -> None:
         """Log scalar data to TensorBoard.
 
@@ -106,7 +120,14 @@ class TensorBoardLogger:
         if not self._writer:
             return
 
-        self._writer.add_scalar(name, data, global_step=step, new_style=True)
+        try:
+            self._writer.add_scalar(name, data, global_step=step, new_style=True)
+        except OSError as e:
+            if e.errno == errno.ESTALE:
+                self._recreate_writer()
+                self._writer.add_scalar(name, data, global_step=step, new_style=True)
+            else:
+                raise
 
     def log_visuals(
         self,
