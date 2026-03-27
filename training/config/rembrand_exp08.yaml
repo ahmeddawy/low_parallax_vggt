@@ -191,7 +191,7 @@ optim:
 
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 5e-5
+    lr: 2e-5
     weight_decay: 0.05
 
   frozen_module_names: null
@@ -233,11 +233,11 @@ optim:
           schedulers:
             - _target_: fvcore.common.param_scheduler.LinearParamScheduler
               start_value: 1e-8
-              end_value: 5e-5
+              end_value: 2e-5        # lower peak — reproj is high-variance
             - _target_: fvcore.common.param_scheduler.CosineParamScheduler
-              start_value: 5e-5
+              start_value: 2e-5
               end_value: 1e-8
-          lengths: [0.05, 0.95]
+          lengths: [0.10, 0.90]     # longer warmup (10 ep) — reproj needs more time to stabilise
           interval_scaling: ['rescaled', 'rescaled']
     weight_decay:
       - scheduler:
