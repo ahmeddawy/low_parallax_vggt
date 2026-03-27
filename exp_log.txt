@@ -251,7 +251,7 @@ Key fixes identified for EXP-04:
   - Keep plane_weight=0.0 (SVD disabled)
 
 --------------------------------------------------------------------------------
-EXP-04  rembrand_lora_r16_plane_rigidity_v3  [RUNNING]
+EXP-04  rembrand_lora_r16_plane_rigidity_v3  [KILLED — ep16]
 --------------------------------------------------------------------------------
 Config  : camera.weight=0.0, depth=null, track.weight=1.0,
           plane_rigidity.weight=0.3, consistency_weight=1.0, plane_weight=0.0
@@ -259,33 +259,69 @@ Config  : camera.weight=0.0, depth=null, track.weight=1.0,
           aggregator.max_norm=1.0
 Dataset : tracking_whisper_clean_dataset
 
-Training dynamics (observed ep0-6):
-  train/loss_track        : 0.22 (E0) -> 0.158 (E6, converging)
-  val/loss_track          : 0.104 (E2, first val run) — BEATS ep5 target of 0.12
-  train/loss_plane_rig    : 0.034 (E0) -> 0.001 (E6, converged to near zero)
-  val/loss_plane_rig      : 0.010 (stable)
-  Grad/track (pre-clip)   : 18.9 (E2) -> 30.5 (E4, spike) -> 4.1 (E6, recovering)
-  Grad/depth              : ~0.000 — confirms depth=null working, depth head dormant
-  Grad/camera             : ~0.001-0.005 — very low, rigidity too weak for 3D signal
+Training dynamics (full run ep0-16):
+  train/loss_track        : 0.22 (E0) -> 0.135 (E16)
+  val/loss_track          : 0.097 (E7, best) -> 0.165 (E14) -> 0.232 (E16) — REGRESSING
+  train/loss_plane_rig    : 0.034 (E0) -> 0.001 (E6+, flatlined)
+  Grad/track (pre-clip)   : 18.9 (E2) -> 30.5 (E4 spike) -> 5.6 (E16)
+  Grad/depth              : 0.000 throughout (no 3D signal reaching depth head)
+  Grad/camera             : 0.001-0.005 (negligible)
 
-Notable events:
-  E4: Grad/track spike to 30.5 (transient). train/loss_track rose to 0.380.
-      Self-corrected by E6 (Grad/track 4.1, train loss 0.158).
-  Val ep5 pending: ep2 val frozen at 0.104. Awaiting ep5 val flush.
+Root cause — why val regressed:
+  The consistency_weight term in plane_rigidity DOES unproject through depth and
+  camera (gradient path exists in code). However, the pretrained VGGT model already
+  satisfies cross-frame 3D consistency approximately — loss converged to ~0.001 from
+  the start. Gradient from this term is so small (~1e-5) it logs as 0.0000.
+  The model can trivially satisfy consistency by collapsing depth to a constant
+  across frames, which gives zero consistency loss but wrong absolute depth.
+  Without reproj loss to enforce absolute geometric accuracy, the model had no
+  incentive to improve 3D — only 2D track supervision, which eventually overfits.
 
-Current issue:
-  loss_plane_rigidity ~0.001 × weight=0.3 = 0.0003 objective contribution (0.04%).
-  Depth/camera heads receiving essentially zero gradient from rigidity.
-  Grad/depth=0.000 confirms no 3D self-supervision signal reaching depth head.
-  3D improvement NOT happening — rigidity is too weak.
-
-Code fix applied during this run:
-  training/loss.py line 445: loss_reg.detach() in confidence term.
-  (Fix was for EXP-05, not needed for EXP-04 since depth=null, but committed
-  to protect future experiments with depth enabled.)
+Action: KILLED at ep16. val/loss_track regressing consistently since ep7 best (0.097).
+        No 3D signal confirmed. Launching EXP-06 to fix root cause.
 
 --------------------------------------------------------------------------------
-EXP-05  rembrand_lora_r16_no_reproj_newdata  [RESTARTED — fixed pod running]
+EXP-04b  rembrand_lora_r16_plane_rigidity_v4  [KILLED — ep8]
+--------------------------------------------------------------------------------
+Config  : camera.weight=0.0, depth=null, track.weight=0.5,
+          plane_rigidity.weight=1.0, consistency_weight=1.0, plane_weight=0.0
+          track.max_norm=0.1, depth.max_norm=0.5, camera.max_norm=0.5
+          aggregator.max_norm=0.5
+Dataset : tracking_whisper_clean_dataset
+
+Motivation (from EXP-04 analysis):
+  EXP-04's 3D self-supervision was not working because:
+  - Rigidity at 0.001×0.3 = 0.04% of objective → inaudible to depth/camera
+  - Grad/depth=0.000 confirmed no gradient reaching depth/camera from rigidity
+  - Track dominated at 1.0 weight, rigidity could not compete
+
+Changes vs EXP-04:
+  plane_rigidity.weight : 0.3 → 1.0  (rigidity becomes first-class signal)
+  track.weight          : 1.0 → 0.5  (reduce track dominance, let rigidity compete)
+  track.max_norm        : 0.3 → 0.1  (pre-clip norm 9-30 → apply 0.1 step, reduce spikes)
+  aggregator.max_norm   : 1.0 → 0.5  (tighter backbone under increased rigidity gradient)
+
+Training dynamics (ep0-8):
+  train/loss_track        : 0.329 (E0) -> 0.303 (E8)
+  val/loss_track          : 0.103 (E5) -> 0.203 (E8)  — regressing
+  train/loss_plane_rig    : 0.00118 (flatlined, same as EXP-04)
+  Grad/depth              : 0.000 throughout — same structural problem as EXP-04
+  Grad/camera             : 0.008-0.017 (marginally higher than EXP-04, but negligible)
+  Grad/track              : 2.06 (E8, stabilised after initial spikes)
+
+Root cause — same as EXP-04:
+  Raising plane_rigidity.weight from 0.3 to 1.0 did NOT help because the loss
+  value itself (~0.001) is the bottleneck, not the weight. The loss is near-zero
+  because the pretrained model already satisfies consistency approximately.
+  Grad/depth remained 0.000 — no 3D supervision reached depth head regardless of
+  weight. The fundamental problem is that consistency_weight cannot distinguish
+  between "correct 3D" and "constant depth collapse" — both give near-zero loss.
+
+Action: KILLED at ep8. Same structural failure as EXP-04. Weight rebalancing alone
+        cannot fix a degenerate loss minimum. Requires reprojection loss (EXP-06).
+
+--------------------------------------------------------------------------------
+EXP-05  rembrand_lora_r16_no_reproj_newdata  [KILLED — ep8]
 --------------------------------------------------------------------------------
 Config  : camera.weight=0.5, depth.weight=0.5, track.weight=1.0, reproj=null
           (EXP-01 reproduction on tracking_whisper_clean_dataset)
@@ -317,38 +353,28 @@ Code fix (training/loss.py):
 
 Second run (NEW pod — dawy-vggt-exp05-tqmft-fqmtc):
   Launched with FIXED code.
-  train/loss_conf_depth   : +0.093 (step 7) — POSITIVE, fix confirmed working
-  Grad/depth              : 3.85 (normal for depth.weight=0.5)
-  Status: step 7, too early to draw conclusions. Monitoring.
+  train/loss_conf_depth   : +0.093 (step 7) -> +0.001 (step 50) — fix held early
+  train/loss_conf_depth   : -1.651 (step 324, ep6) — EXPLOIT RETURNED
+  train/loss_conf_depth   : -1.803 (step 348, ep6) — accelerating
+  train/objective         : -0.088 (step 419, ep8) — objective went negative!
+  val/loss_track          : 0.388 (ep8) — catastrophic, model destabilised
+  Grad/track              : 32.73 (ep8, HIGH)
 
---------------------------------------------------------------------------------
-EXP-04b  rembrand_lora_r16_plane_rigidity_v4  [CONFIG READY — not launched]
---------------------------------------------------------------------------------
-Config  : camera.weight=0.0, depth=null, track.weight=0.5,
-          plane_rigidity.weight=1.0, consistency_weight=1.0, plane_weight=0.0
-          track.max_norm=0.1, depth.max_norm=0.5, camera.max_norm=0.5
-          aggregator.max_norm=0.5
-Dataset : tracking_whisper_clean_dataset
+Root cause — detach fix insufficient:
+  loss_reg.detach() breaks the circular gradient path but does NOT prevent the
+  exploit solution from being reached. The model still drives loss_reg → 0 via
+  the separate loss_reg_depth objective term. Once loss_reg is small (even
+  detached), the optimal confidence conf* = alpha/(gamma*loss_reg_detached)
+  becomes large, and loss_conf = gamma*loss_reg_detached*conf - alpha*log(conf)
+  goes deeply negative. The gradient of the confidence head still descends toward
+  this negative minimum — it just no longer drags the prediction head with it.
+  The exploit held for ~50 steps then reasserted as depth predictions improved.
 
-Motivation (from EXP-04 analysis):
-  EXP-04's 3D self-supervision was not working because:
-  - Rigidity at 0.001×0.3 = 0.04% of objective → inaudible to depth/camera
-  - Grad/depth=0.000 confirmed no gradient reaching depth/camera from rigidity
-  - Track dominated at 1.0 weight, rigidity could not compete
-
-Changes vs EXP-04:
-  plane_rigidity.weight : 0.3 → 1.0  (rigidity becomes first-class signal)
-  track.weight          : 1.0 → 0.5  (reduce track dominance, let rigidity compete)
-  track.max_norm        : 0.3 → 0.1  (pre-clip norm 9-30 → apply 0.1 step, reduce spikes)
-  aggregator.max_norm   : 1.0 → 0.5  (tighter backbone under increased rigidity gradient)
-
-Expected signals confirming 3D supervision is working:
-  - loss_plane_rigidity (train) should rise: 0.001 → 0.005-0.020
-  - Grad/depth > 0.1 (rigidity backprop reaching depth head)
-  - Grad/camera > 0.05 (rigidity backprop reaching camera head)
-  - val/loss_track should hold ≤ 0.15 (track weight halved but signal still strong)
-
-Config committed: acc947b "Add EXP-04b config: rebalanced weights for 3D self-supervision"
+Action: KILLED at ep8. Detach-only fix is insufficient for long runs. The Kendall
+        formulation has a structurally unbounded negative minimum whenever
+        loss_reg → 0. A harder fix is needed (clamp loss_conf ≥ 0, or drop
+        Kendall entirely). Deprioritised in favour of EXP-06 (depth=null avoids
+        the issue entirely while reproj provides the 3D supervision).
 
 ================================================================================
 BUGS FOUND AND FIXED
@@ -389,6 +415,61 @@ BUGS FOUND AND FIXED
    Commit: d4027b7
 
 ================================================================================
+EXP-06  rembrand_lora_r16_reproj_plane_v1  [LAUNCHED]
+================================================================================
+
+Goal: True 3D self-supervision via reprojection loss + plane rigidity.
+      First experiment where Grad/depth > 0 is expected from 3D geometry.
+
+Core insight from EXP-04/04b diagnosis:
+  The plane_rigidity consistency_weight term has a degenerate minimum: the model
+  can collapse depth to a constant across frames and get loss ≈ 0 without ever
+  learning correct absolute depth. This is why Grad/depth = 0.000 in both
+  EXP-04 and EXP-04b despite the loss mathematically flowing through depth.
+
+  The reprojection loss does NOT have this degeneracy:
+    unproject(gt_track_0, pred_depth_0, K_0, E_0) → P_world
+    reproject(P_world, K_j, E_j) must match gt_track_j
+  Collapsing depth to a constant makes reprojection fail unless cameras also
+  collapse — but that breaks the track loss. The constraint is coupled and
+  cannot be gamed by any single-head collapse.
+
+Why reproj was unstable before (EXP-02):
+  Reproj + COLMAP camera loss = two conflicting camera supervision signals.
+  COLMAP labels are noisy for low-parallax → pulls cameras wrong direction
+  while reproj tries to correct → large opposing gradients → instability.
+  This experiment drops camera loss entirely (camera: null).
+
+Config  : camera=null, depth=null, track.weight=1.0, reproj.weight=0.1,
+          plane_rigidity.weight=0.3, consistency_weight=1.0, plane_weight=0.0
+          track.max_norm=0.1, depth.max_norm=0.3, camera.max_norm=0.1
+          aggregator.max_norm=0.5
+Dataset : tracking_whisper_clean_dataset
+Commits : eb9ae5a, a2c3ede
+
+Weight rationale:
+  reproj.weight=0.1    — conservative; reproj loss is in raw pixels (5-20px
+                         early training) so 0.1×10px = 1.0 contribution.
+  track.weight=1.0     — raised from earlier 0.5 to balance reproj pixel scale;
+                         keeps 2D anchor competitive at ~1.0 contribution.
+  plane_rigidity=0.3   — secondary regularizer; once reproj drives real 3D
+                         geometry, consistency adds cross-frame constraint.
+  camera=null          — no COLMAP supervision (root cause of EXP-02 failure)
+  depth=null           — Kendall confidence exploit not yet structurally solved
+
+Gradient clip rationale:
+  camera.max_norm=0.1  — very tight; no prior data on reproj camera grad scale
+  depth.max_norm=0.3   — tighter than EXP-04b (0.5); reproj drives depth harder
+  track.max_norm=0.1   — same as EXP-04b; pre-clip norms were 7-30
+
+Key signals to watch at ep5:
+  - Grad/depth  > 0.1  (reproj backpropagating through depth head — KEY TEST)
+  - Grad/camera > 0.05 (reproj backpropagating through camera head)
+  - loss_reproj decreasing from initial ~10-50px → <10px by ep10
+  - val/loss_track ≤ 0.12 (2D anchor not regressing)
+  - No NaN or explosion in any grad module
+
+================================================================================
 QUANTITATIVE SUMMARY (all experiments, val/loss_track)
 ================================================================================
 
@@ -397,9 +478,10 @@ QUANTITATIVE SUMMARY (all experiments, val/loss_track)
   EXP-01 (ep95)         0.063             5.78px (+232%)      done
   EXP-02 (ep95)         0.056             238.89px (+13627%)  done (catastrophic 3D)
   EXP-03a (ep16)        0.174             —                   killed (conf exploit)
-  EXP-03b (ep16)        0.164             —                   killed (conf exploit + SVD)
-  EXP-04 (ep2 val)      0.104             —                   running (~ep6)
-  EXP-05 (new pod)      —                 —                   running (step 7)
-  EXP-04b               —                 —                   config ready
+  EXP-03b (ep16)        0.164             —                   killed (conf exploit + SVD spike)
+  EXP-04 (ep16)         0.232 (regressed) —                   killed (no 3D signal, val regressed)
+  EXP-04b (ep8)         0.203             —                   killed (same root cause as EXP-04)
+  EXP-05 (ep8)          0.388             —                   killed (conf exploit returned)
+  EXP-06                —                 —                   running (launched 2026-03-27)
 
 ================================================================================
