@@ -1,10 +1,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: dawy-vggt-exp04-
+  generateName: dawy-vggt-exp04b-
   labels:
     jobgroup: dawy-gpu-a100-8x-jobgroup
-    experiment: exp04
+    experiment: exp04b
 spec:
   template:
     metadata:
@@ -28,7 +28,7 @@ spec:
                 "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
               # Run training from inside training/ (Hydra config discovery)
               cd /workspace/vggt/training
-              torchrun --nproc_per_node=8 launch.py --config rembrand_exp04
+              torchrun --nproc_per_node=8 launch.py --config rembrand_exp04b
               echo "=== Training finished or crashed — pod staying alive for inspection ==="
               sleep infinity
           volumeMounts:
