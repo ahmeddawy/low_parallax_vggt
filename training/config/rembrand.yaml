@@ -14,8 +14,8 @@ patch_size: 14
 val_epoch_freq: 5
 max_img_per_gpu: 48   # floor(48/S) = batch_size. S=24 → bs=2, S=8 → bs=6.
 
-limit_train_batches: 28    # ceil(83 train seqs / floor(48/16)) = ceil(83/3) = 28 — one full pass per epoch
-limit_val_batches:   5     # ceil(20 val seqs   / floor(48/12)) = ceil(20/4) = 5  [val avg_img=12 from [8,16]]
+limit_train_batches: 50    # ceil(83 train seqs / floor(48/16)) = ceil(83/3) = 28 — one full pass per epoch
+limit_val_batches:   20     # ceil(20 val seqs   / floor(48/12)) = ceil(20/4) = 5  [val avg_img=12 from [8,16]]
 
 
 data:
