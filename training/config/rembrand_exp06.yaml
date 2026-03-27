@@ -180,16 +180,14 @@ checkpoint:
 loss:
   _target_: loss.MultitaskLoss
 
-  camera:
-    weight: 0.0             # No COLMAP supervision — noisy labels destabilize reproj
-    loss_type: "l1"
+  camera: null              # No COLMAP supervision — noisy labels destabilize reproj
 
   depth: null               # Confidence exploit not yet solved; keep null
 
   point: null
 
   track:
-    weight: 0.5             # 2D anchor — prevents depth/camera from collapsing
+    weight: 1.0             # 2D anchor — raised from 0.5 to balance against reproj pixel scale
 
   reproj:
     weight: 0.1             # Conservative start — reproj gradients to depth+camera
@@ -227,7 +225,7 @@ optim:
         max_norm: 0.3          # Tighter than EXP-04b (0.5) — reproj drives depth harder
         norm_type: 2
       - module_name: ["camera"]
-        max_norm: 0.3          # Tighter — reproj camera gradients can spike early
+        max_norm: 0.1          # Very tight — no prior data on reproj camera grad scale
         norm_type: 2
       - module_name: ["track"]
         max_norm: 0.1
