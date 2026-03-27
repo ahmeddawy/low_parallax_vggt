@@ -190,7 +190,7 @@ loss:
   reproj: null
 
   plane_rigidity:
-    weight: 0.1             # Overall scale — multiplied by the caller before adding to total loss
+    weight: 0.3             # Raised from 0.1 — at 0.1 the term was ~0.3% of objective (too quiet to shape depth/camera)
     consistency_weight: 1.0 # Point consistency term — per-track L2 deviation from cross-frame mean
     plane_weight: 1.0       # Plane fitting term — SVD normal+offset variance across frames (enabled for EXP-03b)
     min_visible_frames: 2   # Track must be visible in ≥2 frames to contribute
