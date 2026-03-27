@@ -1,0 +1,278 @@
+exp_name: rembrand_lora_r16_plane_rigidity_v4
+# EXP-04b: Rebalanced weights + tighter norms to make 3D self-supervision effective.
+#
+# Root-cause analysis from EXP-04 (ep1-5):
+#
+# 1. plane_rigidity.weight: 0.3 → 1.0
+#    EXP-04: loss_plane_rigidity ~0.001 (train) × 0.3 weight = 0.0003 objective contribution (~0.04%).
+#    The 3D self-supervision signal was inaudible — depth/camera heads received essentially
+#    zero gradient from rigidity. Raising to 1.0 brings rigidity to ~0.1% of objective,
+#    giving it a real gradient path into depth/camera.
+#
+# 2. track.weight: 1.0 → 0.5
+#    With track dominating at 1.0 and rigidity at 0.3, the optimizer ignored 3D consistency.
+#    Halving track weight rebalances: rigidity now competes on equal footing.
+#    val/loss_track was already 0.104 at ep5 — headroom exists to reduce track pressure.
+#
+# 3. track.max_norm: 0.3 → 0.1
+#    EXP-04: Grad/track pre-clip = 9-30 with clip=0.3 → gradient scaled to 3% of natural rate.
+#    Tightening to 0.1 reduces per-step track update further, dampening spiky gradient events
+#    and giving the rigidity signal more relative influence per step.
+#
+# 4. aggregator.max_norm: 1.0 → 0.5
+#    Backbone receives gradients from both track and rigidity. Tightening keeps the aggregator
+#    stable as rigidity weight increases — prevents any single loss from monopolising the backbone.
+#
+# Expected behaviour:
+#   - loss_plane_rigidity should rise from ~0.001 to 0.005-0.020 (more active optimisation)
+#   - Grad/depth and Grad/camera should become non-zero as rigidity back-propagates through unprojection
+#   - val/loss_track should hold ≤ 0.12 (target from EXP-04); if it rises above 0.15 at ep5,
+#     track.weight may need to go back to 0.8
+#   - Grad/track pre-clip should stay < 15 (clip is now 0.1 so actual applied grad ≤ 0.1)
+
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 1
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 48
+
+limit_train_batches: 50
+limit_val_batches:   20
+
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: True
+    pin_memory: False
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      load_track: True
+      track_num: 256
+      use_gt_tracks: True
+      use_depth_tracks: False
+      training: True
+      inside_random: True
+      rescale: True
+      rescale_aug: True
+      landscape_check: False
+      debug: False
+      get_nearby: False
+      load_depth: False      # depth: null — no depth loss
+      img_nums: [8, 24]
+      max_img_per_gpu: ${max_img_per_gpu}
+      allow_duplicate_img: False
+      repeat_batch: False
+      augs:
+        cojitter: True
+        cojitter_ratio: 0.3
+        scales: [0.8, 1.2]
+        aspects: [0.5625, 0.5625]
+        color_jitter:
+          brightness: 0.3
+          contrast:   0.3
+          saturation: 0.3
+          hue:        0.05
+          p: 0.8
+        gray_scale: True
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.colmap.ColmapDataset
+          split: train
+          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/
+          depth_dir_name: depth
+          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/train_split.txt
+
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    shuffle: False
+    pin_memory: False
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      fix_img_num: -1
+      fix_aspect_ratio: 1.0
+      load_track: True
+      track_num: 256
+      use_gt_tracks: True
+      use_depth_tracks: False
+      training: False
+      inside_random: True
+      rescale: True
+      rescale_aug: False
+      landscape_check: False
+      debug: False
+      get_nearby: False
+      load_depth: False
+      img_nums: [8, 16]
+      allow_duplicate_img: False
+      augs:
+        cojitter: False
+        cojitter_ratio: 0.5
+        scales: null
+        aspects: [0.5625, 0.5625]
+        color_jitter: null
+        gray_scale: False
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.colmap.ColmapDataset
+          split: val
+          DATASET_DIR: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/
+          depth_dir_name: depth
+          sequence_list_file: /mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset/val_split.txt
+
+
+logging:
+  log_dir: /mnt/bucket/dawy/law_parallax_vggt_exp1/${exp_name}
+  log_visuals: False
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - objective
+        - loss_plane_rigidity
+        - loss_track
+        - loss_vis_track
+        - loss_conf_track
+    val:
+      keys_to_log:
+        - objective
+        - loss_plane_rigidity
+        - loss_track
+        - loss_vis_track
+        - loss_conf_track
+
+
+checkpoint:
+  save_dir: /mnt/bucket/dawy/law_parallax_vggt_exp2/plane_rigidity/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: null
+  no_resume: true
+  strict: False
+
+
+loss:
+  _target_: loss.MultitaskLoss
+
+  camera:
+    weight: 0.0             # COLMAP supervision dropped — proven to destroy 3D geometry in low-parallax
+    loss_type: "l1"
+
+  depth: null               # Confidence exploit fix not yet tested enough; keep null for now
+
+  point: null
+
+  track:
+    weight: 0.5             # Reduced from 1.0 — val/loss_track was 0.104 at ep5, headroom to reduce pressure
+
+  reproj: null
+
+  plane_rigidity:
+    weight: 1.0             # Raised from 0.3 — at 0.3 contribution was 0.04% of objective (inaudible to depth/camera)
+    consistency_weight: 1.0 # Per-track L2 deviation from cross-frame mean
+    plane_weight: 0.0       # SVD plane fitting still disabled — Grad/camera spikes to 251 in EXP-03b
+    min_visible_frames: 2
+
+
+optim:
+  param_group_modifiers: False
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 5e-5
+    weight_decay: 0.05
+
+  frozen_module_names: null
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 0.5          # Tightened from 1.0 — backbone receives rigidity+track; tighter keeps it stable
+        norm_type: 2
+      - module_name: ["depth"]
+        max_norm: 0.5
+        norm_type: 2
+      - module_name: ["camera"]
+        max_norm: 0.5
+        norm_type: 2
+      - module_name: ["track"]
+        max_norm: 0.1          # Tightened from 0.3 — pre-clip norm was 9-30 in EXP-04; reduce track step size
+        norm_type: 2
+
+  lora:
+    pretrained_checkpoint_path: /workspace/low_parallax_vggt/model.pt
+    r: 16
+    lora_alpha: 32
+    target_modules:
+      - qkv
+      - proj
+    lora_dropout: 0.0
+    fresh_heads: False
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 5e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 5e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.05
+
+
+max_epochs: 100
+
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: True
+  enable_depth: True
+  enable_point: False
+  enable_track: True
+
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: False
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True
