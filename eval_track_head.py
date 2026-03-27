@@ -1264,9 +1264,10 @@ def eval_split(
                     json.dump(ae_record, fh, indent=2)
 
         # Visualization for first vis_max_seqs sequences in this split
+        # vis_max_seqs == 0: disabled; > 0: first N; -1: all
         if (
-            vis_max_seqs > 0
-            and viz_count < vis_max_seqs
+            vis_max_seqs != 0
+            and (vis_max_seqs < 0 or viz_count < vis_max_seqs)
             and preds_by_tag
             and gt_tracks_seq is not None
             and image_paths_seq
@@ -1443,11 +1444,9 @@ def main():
         print(f"Auto-discovered {len(eval_seqs)} sequences in {args.dataset_dir}")
         splits = [("eval", eval_seqs)]
 
-    if args.vis_max_seqs > 0:
-        print(
-            f"Visualization: first {args.vis_max_seqs} seqs per split "
-            f"-> {args.vis_dir}/"
-        )
+    if args.vis_max_seqs != 0:
+        label = "all" if args.vis_max_seqs < 0 else f"first {args.vis_max_seqs}"
+        print(f"Visualization: {label} seqs per split -> {args.vis_dir}/")
 
     print(
         f"Homography refinement: "
