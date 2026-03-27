@@ -274,7 +274,7 @@ model:
 distributed:
   backend: nccl
   comms_dtype: None
-  find_unused_parameters: False
+  find_unused_parameters: True   # camera=null → camera head gets no grad on batches where reproj/plane_rigidity return None
   timeout_mins: 30
   gradient_as_bucket_view: True
   bucket_cap_mb: 25
