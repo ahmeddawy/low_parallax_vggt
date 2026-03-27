@@ -441,8 +441,10 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
     loss_reg = check_and_fix_inf_nan(loss_reg, "loss_reg")
 
     # Confidence-weighted loss: gamma * loss * conf - alpha * log(conf)
-    # This encourages the model to be confident on easy examples and less confident on hard ones
-    loss_conf = gamma * loss_reg * conf[mask] - alpha * torch.log(conf[mask])
+    # loss_reg is detached so the confidence head learns uncertainty from current prediction
+    # quality without creating a circular exploit (better preds → higher conf → more negative
+    # loss → incentive for better preds). Prediction head still trains via loss_reg_depth.
+    loss_conf = gamma * loss_reg.detach() * conf[mask] - alpha * torch.log(conf[mask])
     loss_conf = check_and_fix_inf_nan(loss_conf, "loss_conf")
         
     # Initialize gradient loss
