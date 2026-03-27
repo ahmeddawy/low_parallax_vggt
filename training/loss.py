@@ -1266,17 +1266,30 @@ def compute_plane_rigidity_loss(
         )
         total_loss = total_loss + plane_weight * plane_loss
 
-        # Render visualization — only when requested, adds matplotlib overhead
-        if visualize:
-            vis_image = _render_plane_fitting_figure(world_pts_f32, normals, offsets)
-        else:
-            vis_image = None
     else:
-        vis_image = None
+        world_pts_f32 = None
+        normals = None
+        offsets = None
 
     total_loss = check_and_fix_inf_nan(total_loss, "plane_rigidity_loss", hard_max=100.0)
 
     if visualize:
+        if world_pts_f32 is None:  # plane_weight=0 — compute SVD for viz only, no grad
+            with torch.no_grad():
+                world_pts_f32 = world_pts.float()
+                normals_list, offsets_list = [], []
+                for i in range(S):
+                    n_i, d_i = _fit_plane_svd(world_pts_f32[:, i, :, :])
+                    normals_list.append(n_i)
+                    offsets_list.append(d_i)
+                normals = torch.stack(normals_list, dim=1)
+                offsets = torch.stack(offsets_list, dim=1)
+                dot    = (normals * normals[:, :1, :]).sum(dim=-1)
+                signs  = dot.sign()
+                signs  = torch.where(signs == 0, torch.ones_like(signs), signs)
+                normals = normals * signs.unsqueeze(-1)
+                offsets = offsets * signs
+        vis_image = _render_plane_fitting_figure(world_pts_f32, normals, offsets)
         return total_loss, vis_image
     return total_loss
 
