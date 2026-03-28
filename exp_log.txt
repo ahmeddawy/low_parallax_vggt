@@ -493,6 +493,16 @@ Results (ep0-34, fresh run after preemption, LR peak 5e-5):
   ep35: 0.259 (TB confirms — oscillation continuing; ep40 expected to recover)
   Best checkpoint: ep20 (val/loss_track=0.129)
 
+  Later (after LR dropped below peak via cosine decay — oscillation damped):
+  ep71: 0.074  (oscillation eased)
+  ep80: 0.076  (cosine decay continuing)
+  ep90: ~0.054 (extrapolated — see ep95)
+  ep95: 0.0526 *** NEW BEST — lowest val/loss_track of all experiments ***
+  Grad/aggregator=0.54, Grad/depth=0.20, Grad/camera=0.21, Grad/track=5.0
+  train/loss_reproj=1.078, val/loss_reproj=0.761
+  train/loss_plane_rigidity=0.181, val/loss_plane_rigidity=0.172
+  5 epochs remain (ep100). Still improving — expect ep100 may be best.
+
 ================================================================================
 QUANTITATIVE SUMMARY (all experiments, val/loss_track)
 ================================================================================
@@ -506,10 +516,10 @@ QUANTITATIVE SUMMARY (all experiments, val/loss_track)
   EXP-04 (ep16)         0.232 (regressed) —                   killed (no 3D signal, val regressed)
   EXP-04b (ep8)         0.203             —                   killed (same root cause as EXP-04)
   EXP-05 (ep8)          0.388             —                   killed (conf exploit returned)
-  EXP-06                0.074 (ep71)      —                   running ep71 — oscillation eased by cosine decay
-  EXP-07                0.060 (ep70)      —                   done ep72 — track-only baseline (depth+camera dead)
-  EXP-08 run1           0.058 (ep35)      —                   KILLED — NaN grads (depth_consistency NaN) + preemption
-  EXP-08 run2           0.086 (ep62)      —                   KILLED — same NaN root cause; run1 ep35 ckpt preserved
+  EXP-06                0.0526 (ep95)     —                   running ep95/100 *** BEST *** (was 0.074 ep71)
+  EXP-07                0.0583 (ep98)     —                   ep98/100, effectively done — track-only baseline
+  EXP-08 run1           0.058 (ep35)      —                   KILLED — NaN grads; run1 ep35 ckpt preserved
+  EXP-08 run2           NaN grads ep86    —                   STILL RUNNING — kill pod (Grad/* NaN, structural)
 
 ================================================================================
 EXP-07  rembrand_lora_r16_depth_consistency_v1  [DONE — ep72]
@@ -571,6 +581,8 @@ Results (ep0-32, fresh full run, LR peak 5e-5):
   ep60: 0.413 spike (train=0.063 fine — single-batch val oscillation, val/depth_consistency=0.333 coincident)
   ep70: 0.0823 (partial val run, 14/20 batches)
   ep72: train/loss_track=0.083, val/loss_track=0.060 (new best at last complete val run ep70)
+  ep98: val/loss_track=0.0583, Grad/depth=0.0002 (dead), loss_depth_consistency≈0 confirmed.
+        Effectively done. Best checkpoint remains ep70 (val=0.0778 per earlier estimate).
   Best checkpoint: checkpoint_70.pt (val/loss_track=0.060)
 
 Final diagnosis:
