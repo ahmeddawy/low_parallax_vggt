@@ -1,0 +1,150 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: dawy-vggt-eval2d-idx-
+  labels:
+    jobgroup: dawy-gpu-a100-8x-jobgroup
+    experiment: eval-2d-indexed
+spec:
+  # 10 shards: each pod handles ceil(N_seqs / 10) sequences.
+  # Tune parallelism down if cluster capacity is limited.
+  completions: 10
+  parallelism: 10
+  completionMode: Indexed
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: research
+          image: us-central1-docker.pkg.dev/rembrand-ai/rembrand-repo/vggt-training:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              eval '/usr/sbin/sshd -D &'
+              git clone https://github.com/ahmeddawy/low_parallax_vggt.git /workspace/vggt
+              cd /workspace/vggt && git checkout plane-rigidity
+              pip install -e /workspace/vggt -q
+
+              # Vanilla VGGT-1B checkpoint
+              mkdir -p /workspace/low_parallax_vggt
+              wget -q -O /workspace/low_parallax_vggt/model.pt \
+                "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+
+              DATASET=/mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset
+              VANILLA=/workspace/low_parallax_vggt/model.pt
+              BASE=/mnt/bucket/dawy/law_parallax_vggt_exp2
+              IDX=${JOB_COMPLETION_INDEX}   # 0 .. 9
+              N_SHARDS=10
+
+              # ---------------------------------------------------------------
+              # Build per-split shard files for this pod
+              # Each split file is sharded independently so every shard has a
+              # proportional slice of both train and val.
+              # ---------------------------------------------------------------
+              shard_split() {
+                local src=$1 dst=$2
+                local total=$(wc -l < "$src")
+                local size=$(( (total + N_SHARDS - 1) / N_SHARDS ))
+                local start=$(( IDX * size + 1 ))
+                local end=$(( start + size - 1 ))
+                sed -n "${start},${end}p" "$src" > "$dst"
+                echo "  shard $IDX: lines $start-$end of $total -> $(wc -l < $dst) seqs"
+              }
+
+              shard_split $DATASET/val_split.txt   /tmp/val_shard.txt
+              shard_split $DATASET/train_split.txt /tmp/train_shard.txt
+
+              if [ ! -s /tmp/val_shard.txt ] && [ ! -s /tmp/train_shard.txt ]; then
+                echo "Shard $IDX: no sequences assigned, exiting."
+                exit 0
+              fi
+
+              run_eval() {
+                local tag=$1 ckpt=$2 out_base=$3
+                local out=$out_base/eval_shard
+                mkdir -p $out
+                echo "=== [$tag] shard $IDX ===" | tee -a $out/shard_${IDX}.log
+
+                local val_args=""
+                local train_args=""
+                [ -s /tmp/val_shard.txt ]   && val_args="--val-split-file /tmp/val_shard.txt"
+                [ -s /tmp/train_shard.txt ] && train_args="--train-split-file /tmp/train_shard.txt"
+
+                python /workspace/vggt/eval_track_head.py \
+                  --vanilla-ckpt     $VANILLA \
+                  --finetuned-ckpt   $ckpt \
+                  --lora \
+                  --dataset-dir      $DATASET \
+                  $val_args \
+                  $train_args \
+                  --train-max-seqs   -1 \
+                  --vis-max-seqs     -1 \
+                  --vis-n-tracks     50 \
+                  --ransac-thresh    3.0 \
+                  --output-json      $out/shard_${IDX}.json \
+                  --vis-dir          $out/viz \
+                  --homography-dir   $out/homographies \
+                  --ae-output-dir    $out/ae_output \
+                  2>&1 | tee -a $out/shard_${IDX}.log
+
+                echo "=== [$tag] shard $IDX done ===" | tee -a $out/shard_${IDX}.log
+              }
+
+              # ---------------------------------------------------------------
+              # EXP-06  ep95  (track + reproj + plane_rigidity)  ← BEST
+              # ---------------------------------------------------------------
+              run_eval "EXP-06-ep95" \
+                $BASE/reproj_plane/rembrand_lora_r16_reproj_plane_v1/ckpts/checkpoint_95.pt \
+                $BASE/reproj_plane/rembrand_lora_r16_reproj_plane_v1
+
+              # ---------------------------------------------------------------
+              # EXP-07  ep70  (track-only baseline)
+              # ---------------------------------------------------------------
+              run_eval "EXP-07-ep70" \
+                $BASE/depth_consistency/rembrand_lora_r16_depth_consistency_v1/ckpts/checkpoint_70.pt \
+                $BASE/depth_consistency/rembrand_lora_r16_depth_consistency_v1
+
+              # ---------------------------------------------------------------
+              # EXP-08  ep35  (last clean checkpoint before NaN)
+              # ---------------------------------------------------------------
+              run_eval "EXP-08-ep35" \
+                $BASE/track_depth_reproj/rembrand_lora_r16_track_depth_reproj_v1/ckpts/checkpoint_35.pt \
+                $BASE/track_depth_reproj/rembrand_lora_r16_track_depth_reproj_v1
+
+              echo "=== Shard $IDX complete ==="
+          volumeMounts:
+            - mountPath: /mnt/bucket
+              name: bucket
+            - mountPath: /mnt/nfs
+              name: volume
+            - mountPath: /dev/shm
+              name: dshm
+          ports:
+            - name: ssh
+              containerPort: 22
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 16
+              memory: 200Gi
+              nvidia.com/gpu: 1
+      nodeSelector:
+        cloud.google.com/gke-nodepool: gpu-nodes-a100-80gb-8x-flex
+        cloud.google.com/gke-flex-start: "true"
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      serviceAccountName: gke-node-k8s-sa
+      volumes:
+        - name: volume
+          persistentVolumeClaim:
+            claimName: diffusion
+        - name: bucket
+          persistentVolumeClaim:
+            claimName: gcs-fuse-csi-static-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
