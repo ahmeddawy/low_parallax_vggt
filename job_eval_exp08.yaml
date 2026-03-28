@@ -1,0 +1,97 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: dawy-vggt-eval-exp08-
+  labels:
+    jobgroup: dawy-gpu-a100-8x-jobgroup
+    experiment: eval-exp08
+spec:
+  completions: 10
+  parallelism: 10
+  completionMode: Indexed
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: research
+          image: us-central1-docker.pkg.dev/rembrand-ai/rembrand-repo/vggt-training:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              git clone https://github.com/ahmeddawy/low_parallax_vggt.git /workspace/vggt
+              cd /workspace/vggt && git checkout plane-rigidity
+              pip install -e /workspace/vggt -q
+
+              mkdir -p /workspace/low_parallax_vggt
+              wget -q -O /workspace/low_parallax_vggt/model.pt \
+                "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+
+              DATASET=/mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset
+              CKPT=/mnt/bucket/dawy/law_parallax_vggt_exp2/track_depth_reproj/rembrand_lora_r16_track_depth_reproj_v1/ckpts/checkpoint_35.pt
+              OUT=/mnt/bucket/dawy/law_parallax_vggt_exp2/track_depth_reproj/rembrand_lora_r16_track_depth_reproj_v1/eval_ep35/shard
+              IDX=${JOB_COMPLETION_INDEX}
+              N_SHARDS=10
+
+              shard_split() {
+                local src=$1 dst=$2
+                local total=$(wc -l < "$src")
+                local size=$(( (total + N_SHARDS - 1) / N_SHARDS ))
+                local start=$(( IDX * size + 1 ))
+                local end=$(( start + size - 1 ))
+                sed -n "${start},${end}p" "$src" > "$dst"
+              }
+
+              shard_split $DATASET/val_split.txt   /tmp/val_shard.txt
+              shard_split $DATASET/train_split.txt /tmp/train_shard.txt
+
+              mkdir -p $OUT
+
+              VAL_ARG="";   [ -s /tmp/val_shard.txt ]   && VAL_ARG="--val-split-file /tmp/val_shard.txt"
+              TRAIN_ARG=""; [ -s /tmp/train_shard.txt ] && TRAIN_ARG="--train-split-file /tmp/train_shard.txt"
+
+              python /workspace/vggt/eval_track_head.py \
+                --vanilla-ckpt    /workspace/low_parallax_vggt/model.pt \
+                --finetuned-ckpt  $CKPT \
+                --lora \
+                --dataset-dir     $DATASET \
+                $VAL_ARG $TRAIN_ARG \
+                --train-max-seqs  -1 \
+                --vis-max-seqs    -1 \
+                --vis-n-tracks    50 \
+                --ransac-thresh   3.0 \
+                --output-json     $OUT/shard_${IDX}.json \
+                --vis-dir         $OUT/viz \
+                --homography-dir  $OUT/homographies \
+                --ae-output-dir   $OUT/ae_output \
+                2>&1 | tee $OUT/shard_${IDX}.log
+          volumeMounts:
+            - mountPath: /mnt/bucket
+              name: bucket
+            - mountPath: /mnt/nfs
+              name: volume
+            - mountPath: /dev/shm
+              name: dshm
+          resources:
+            limits:
+              cpu: 16
+              memory: 200Gi
+              nvidia.com/gpu: 1
+      nodeSelector:
+        cloud.google.com/gke-nodepool: gpu-nodes-a100-80gb-8x-flex
+        cloud.google.com/gke-flex-start: "true"
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      serviceAccountName: gke-node-k8s-sa
+      volumes:
+        - name: volume
+          persistentVolumeClaim:
+            claimName: diffusion
+        - name: bucket
+          persistentVolumeClaim:
+            claimName: gcs-fuse-csi-static-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
