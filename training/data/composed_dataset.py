@@ -135,6 +135,9 @@ class ComposedDataset(Dataset, ABC):
 
 
         # --- Prepare Final Sample Dictionary ---
+        original_sizes = torch.from_numpy(
+            np.stack(batch["original_sizes"]).astype(np.float32)
+        )  # (S, 2) — [H_orig, W_orig] per frame
         sample = {
             "seq_name": seq_name,
             "ids": ids,
@@ -145,6 +148,7 @@ class ComposedDataset(Dataset, ABC):
             "cam_points": cam_points,
             "world_points": world_points,
             "point_masks": point_masks,
+            "original_sizes": original_sizes,
         }
 
         # --- Track Processing (if enabled) ---
