@@ -31,8 +31,8 @@ spec:
                 "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
 
               DATASET=/mnt/bucket/dawy/vggt_finetune/tracking_whisper_clean_dataset
-              CKPT=/mnt/bucket/dawy/law_parallax_vggt_exp2/reproj_plane/rembrand_lora_r16_reproj_plane_v1/ckpts/checkpoint_95.pt
-              OUT=/mnt/bucket/dawy/law_parallax_vggt_exp2/reproj_plane/rembrand_lora_r16_reproj_plane_v1/eval_ep95
+              CKPT=/mnt/bucket/dawy/law_parallax_vggt_exp2/reproj_plane/rembrand_lora_r16_reproj_plane_v1/ckpts/checkpoint_90.pt
+              OUT=/mnt/bucket/dawy/law_parallax_vggt_exp2/reproj_plane/rembrand_lora_r16_reproj_plane_v1/eval_ep90
               IDX=${JOB_COMPLETION_INDEX}
               N_SHARDS=10
 
