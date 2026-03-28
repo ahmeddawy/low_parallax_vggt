@@ -24,7 +24,7 @@ class MultitaskLoss(torch.nn.Module):
     - Point loss
     - Tracking loss
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, reproj=None, plane_rigidity=None, depth_consistency=None, **kwargs):
+    def __init__(self, camera=None, depth=None, point=None, track=None, reproj=None, plane_rigidity=None, depth_consistency=None, homography=None, **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
@@ -34,6 +34,7 @@ class MultitaskLoss(torch.nn.Module):
         self.reproj = reproj
         self.plane_rigidity = plane_rigidity
         self.depth_consistency = depth_consistency
+        self.homography = homography
 
     def forward(self, predictions, batch, visualize=False) -> torch.Tensor:
         """
@@ -144,6 +145,18 @@ class MultitaskLoss(torch.nn.Module):
             if dc_loss is not None:
                 total_loss = total_loss + dc_loss * self.depth_consistency.get("weight", 1.0)
                 loss_dict["loss_depth_consistency"] = dc_loss
+
+        # Homography consistency loss — plane-at-infinity, original resolution, camera head only
+        if (
+            self.homography is not None
+            and "pose_enc_list" in predictions
+            and has_tracks
+            and batch.get("tracks_orig") is not None
+        ):
+            hom_loss = compute_homography_loss(predictions, batch, **self.homography)
+            if hom_loss is not None:
+                total_loss = total_loss + hom_loss * self.homography.get("weight", 0.1)
+                loss_dict["loss_homography"] = hom_loss
 
         loss_dict["objective"] = total_loss
 
@@ -1452,3 +1465,133 @@ def compute_depth_track_consistency_loss(predictions, batch, weight=1.0, min_sha
         return None
 
     return total_loss / n_pairs
+
+
+def compute_homography_loss(predictions, batch, weight=1.0, **kwargs):
+    """
+    Plane-at-infinity homography consistency loss at original image resolution.
+
+    For each frame t in 1..S:
+      H_0→t = K_t_orig @ R_rel @ K_0_orig^{-1}   (no depth, no translation)
+      Apply H to frame-0 GT tracks (original px) → predicted frame-t positions.
+      L1 error against frame-t GT tracks (original px), masked by visibility.
+
+    Gradient flows to camera head (R, K) only — no depth in the loop.
+
+    Args:
+        predictions: dict with "pose_enc_list" (list of B,S,9 tensors)
+        batch:       dict with "tracks_orig" (B,S,N,2), "track_vis_mask" (B,S,N),
+                     "images" (B,S,3,H_model,W_model), "original_sizes" (list/tensor)
+        weight:      scalar weight (absorbed by caller)
+
+    Returns:
+        Scalar loss tensor, or None if no valid tracks.
+    """
+    if batch.get("tracks_orig") is None:
+        return None
+
+    gt_tracks_orig = batch["tracks_orig"]   # B, S, N, 2 — original pixel coords
+    gt_vis = batch["track_vis_mask"]        # B, S, N  (bool)
+
+    B, S, N, _ = gt_tracks_orig.shape
+    first_vis = gt_vis[:, 0, :]             # B, N
+    if not first_vis.any():
+        return None
+
+    image_hw = batch["images"].shape[-2:]   # (H_model, W_model)
+    H_model, W_model = image_hw
+
+    # Decode last-stage pose encoding → extrinsics (B,S,3,4), intrinsics (B,S,3,3) at model res
+    pred_pose_enc = predictions["pose_enc_list"][-1]   # B, S, 9
+    pred_extrinsics, pred_intrinsics = pose_encoding_to_extri_intri(pred_pose_enc, image_hw)
+    # pred_intrinsics: (B, S, 3, 3) — fx/fy/cx/cy at model resolution
+
+    # Scale predicted intrinsics to original image resolution.
+    # original_sizes: collated as (B, S, 2) with [H_orig, W_orig] per frame.
+    # Use frame-0 original size for the scale factor (consistent within a sequence).
+    orig_sizes = batch["original_sizes"]  # (B, S, 2) tensor after collation
+    if isinstance(orig_sizes, (list, tuple)):
+        # Fallback: not collated as tensor — skip loss
+        return None
+    # orig_sizes: (B, S, 2), values are [H_orig, W_orig]
+    H_orig = orig_sizes[:, 0, 0].float()   # B
+    W_orig = orig_sizes[:, 0, 1].float()   # B
+    sx = W_orig / float(W_model)           # B
+    sy = H_orig / float(H_model)           # B
+
+    # Scale (B,) → (B,1,1) for broadcasting against (B,3,3)
+    sx3 = sx.view(B, 1, 1)
+    sy3 = sy.view(B, 1, 1)
+
+    # Build scale matrix S = diag(sx, sy, 1) per batch: (B, 3, 3)
+    scale_mat = torch.zeros(B, 3, 3, device=pred_intrinsics.device, dtype=pred_intrinsics.dtype)
+    scale_mat[:, 0, 0] = sx
+    scale_mat[:, 1, 1] = sy
+    scale_mat[:, 2, 2] = 1.0
+
+    # K_orig[b,s] = scale_mat[b] @ K_model[b,s]
+    # (B,3,3) @ (B,S,3,3) — broadcast over S
+    K_model = pred_intrinsics  # (B, S, 3, 3)
+    K_orig = torch.einsum("bij,bsjk->bsik", scale_mat, K_model)  # (B, S, 3, 3)
+
+    # Frame-0 tracks in original px: (B, N, 2)
+    track0_orig = gt_tracks_orig[:, 0, :, :]   # B, N, 2
+
+    # Analytical K^{-1} for frame 0 (upper-triangular PINHOLE)
+    K0 = K_orig[:, 0, :, :]   # B, 3, 3
+    fx0 = K0[:, 0, 0].clamp(min=1e-2)
+    fy0 = K0[:, 1, 1].clamp(min=1e-2)
+    cx0 = K0[:, 0, 2]
+    cy0 = K0[:, 1, 2]
+    K0_inv = torch.zeros_like(K0)
+    K0_inv[:, 0, 0] =  1.0 / fx0
+    K0_inv[:, 1, 1] =  1.0 / fy0
+    K0_inv[:, 0, 2] = -cx0 / fx0
+    K0_inv[:, 1, 2] = -cy0 / fy0
+    K0_inv[:, 2, 2] =  1.0
+
+    R0 = pred_extrinsics[:, 0, :3, :3]   # B, 3, 3
+
+    total_loss = 0.0
+    n_valid = 0
+
+    for t in range(1, S):
+        valid_t = first_vis & gt_vis[:, t, :]   # B, N
+        if not valid_t.any():
+            continue
+
+        Rt = pred_extrinsics[:, t, :3, :3]   # B, 3, 3
+        Kt = K_orig[:, t, :, :]              # B, 3, 3
+
+        # R_rel = Rt @ R0^T  (relative rotation frame-0 → frame-t)
+        R_rel = torch.bmm(Rt, R0.transpose(-1, -2))   # B, 3, 3
+
+        # H = Kt @ R_rel @ K0_inv  (plane-at-infinity homography)
+        H = torch.bmm(torch.bmm(Kt, R_rel), K0_inv)   # B, 3, 3
+
+        # Apply H to frame-0 tracks: (B, N, 3) homogeneous → (B, N, 2)
+        ones = torch.ones(B, N, 1, device=track0_orig.device, dtype=track0_orig.dtype)
+        pts_h = torch.cat([track0_orig, ones], dim=-1)     # B, N, 3
+        proj = torch.bmm(pts_h, H.transpose(-1, -2))       # B, N, 3
+
+        w = proj[:, :, 2:3].clamp(min=1e-6)
+        pred_t = proj[:, :, :2] / w                        # B, N, 2  (original px)
+
+        # L1 error against GT frame-t original tracks
+        gt_t = gt_tracks_orig[:, t, :, :]                  # B, N, 2
+        err = (pred_t - gt_t).abs().sum(dim=-1)            # B, N  (sum x+y)
+
+        err_valid = err[valid_t]
+        if err_valid.numel() == 0:
+            continue
+
+        frame_loss = check_and_fix_inf_nan(
+            err_valid.mean(), f"homography_t{t}", hard_max=500.0
+        )
+        total_loss = total_loss + frame_loss
+        n_valid += 1
+
+    if n_valid == 0:
+        return None
+
+    return total_loss / n_valid

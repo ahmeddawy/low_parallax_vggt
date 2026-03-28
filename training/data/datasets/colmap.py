@@ -532,6 +532,7 @@ class ColmapDataset(BaseDataset):
             "point_masks": point_masks,
             "original_sizes": original_sizes,
             "tracks": tracks,
+            "tracks_orig": raw_tracks if tracks is not None else None,  # (S, N, 2) original pixel space
             "track_masks": track_masks,
         }
         return batch

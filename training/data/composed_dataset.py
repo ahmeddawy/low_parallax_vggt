@@ -155,6 +155,9 @@ class ComposedDataset(Dataset, ABC):
             if has_gt:
                 gt_tracks = torch.from_numpy(np.stack(batch["tracks"]).astype(np.float32))
                 gt_vis_mask = torch.from_numpy(np.stack(batch["track_masks"]).astype(bool))
+                has_orig = batch.get("tracks_orig") is not None
+                if has_orig:
+                    gt_tracks_orig = torch.from_numpy(np.stack(batch["tracks_orig"]).astype(np.float32))
 
                 # Use all available GT tracks (no repetition), capped at track_num
                 valid_idx = torch.where(gt_vis_mask[0])[0]
@@ -162,6 +165,8 @@ class ComposedDataset(Dataset, ABC):
                 sampled = valid_idx[torch.randperm(len(valid_idx))][:n_gt]
                 gt_tracks = gt_tracks[:, sampled, :]
                 gt_vis_mask = gt_vis_mask[:, sampled]
+                if has_orig:
+                    gt_tracks_orig = gt_tracks_orig[:, sampled, :]
 
                 # Pad to track_num so all samples collate to the same size.
                 # Sequences with fewer tracks than track_num get zero-padded
@@ -175,6 +180,10 @@ class ComposedDataset(Dataset, ABC):
                     gt_vis_mask = torch.cat(
                         [gt_vis_mask, torch.zeros(S, pad, dtype=torch.bool)], dim=1
                     )
+                    if has_orig:
+                        gt_tracks_orig = torch.cat(
+                            [gt_tracks_orig, torch.zeros(S, pad, 2, dtype=gt_tracks_orig.dtype)], dim=1
+                        )
 
             # --- Depth-based background tracks (on-the-fly) ---
             # Fill remaining slots up to track_num
@@ -205,6 +214,8 @@ class ComposedDataset(Dataset, ABC):
             sample["tracks"] = tracks
             sample["track_vis_mask"] = track_vis_mask
             sample["track_positive_mask"] = track_positive_mask
+            if has_gt and has_orig:
+                sample["tracks_orig"] = gt_tracks_orig  # (S, N, 2) original pixel space
 
         return sample
 

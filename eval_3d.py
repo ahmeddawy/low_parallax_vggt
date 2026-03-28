@@ -92,6 +92,15 @@ def parse_args():
         "--colmap-dir", default=None,
         help="If set, write COLMAP sparse reconstructions here",
     )
+    # Bundle adjustment
+    p.add_argument(
+        "--run-ba", action="store_true", default=False,
+        help="Run COLMAP bundle adjustment on predicted cameras and eval refined result",
+    )
+    p.add_argument("--ba-colmap-bin", default="colmap",
+        help="Path to COLMAP binary (default: colmap)")
+    p.add_argument("--ba-max-iter", type=int, default=100,
+        help="Max BA iterations (default: 100)")
     # Visualization
     p.add_argument(
         "--vis-max-seqs", type=int, default=3,
@@ -113,9 +122,9 @@ def parse_args():
 
 def load_model(
     ckpt_path, lora=False, lora_r=16, lora_alpha=32.0,
-    lora_targets="qkv,proj", device="cuda",
+    lora_targets="qkv,proj", device="cuda", enable_track=False,
 ):
-    model = VGGT(enable_point=False, enable_track=False)
+    model = VGGT(enable_point=False, enable_track=enable_track)
 
     if lora:
         from peft import LoraConfig, get_peft_model
@@ -474,6 +483,285 @@ def write_colmap(
 
 
 # ---------------------------------------------------------------------------
+# Bundle adjustment helpers
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _run_track_head_ba(model, images_tensor, query_pts_model, device, dtype, chunk_size=128):
+    """
+    Run the VGGT track head for BA correspondences.
+
+    Args:
+        model:            VGGT model (enable_track=True) on device
+        images_tensor:    (S, 3, H, W) float32 [0,1]
+        query_pts_model:  (N, 2) float32 in MODEL pixel coords (frame-0 query)
+        chunk_size:       max tracks per forward pass
+
+    Returns:
+        pred_tracks: (S, N, 2) float32 in model pixel coords
+        pred_vis:    (S, N)    float32 [0,1]
+    """
+    N = query_pts_model.shape[0]
+    images_batch = images_tensor.unsqueeze(0).to(device)
+
+    with torch.cuda.amp.autocast(dtype=dtype):
+        agg_tokens, patch_start_idx = model.aggregator(images_batch)
+        feature_maps = model.track_head.feature_extractor(
+            agg_tokens, images_batch, patch_start_idx
+        )
+
+    all_tracks, all_vis = [], []
+    query_tensor = torch.from_numpy(query_pts_model)
+
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        qpts = query_tensor[start:end].unsqueeze(0).to(device)
+        with torch.cuda.amp.autocast(dtype=dtype):
+            coord_preds, vis, _ = model.track_head.tracker(
+                query_points=qpts,
+                fmaps=feature_maps,
+                iters=model.track_head.iters,
+            )
+        all_tracks.append(coord_preds[-1].squeeze(0).cpu().float())  # (S, chunk, 2)
+        all_vis.append(vis.squeeze(0).cpu().float())                  # (S, chunk)
+
+    pred_tracks = torch.cat(all_tracks, dim=1).numpy()  # (S, N, 2) model coords
+    pred_vis = torch.cat(all_vis, dim=1).numpy()         # (S, N)
+    return pred_tracks, pred_vis
+
+
+def write_colmap_from_pred_tracks(
+    out_dir, image_paths,
+    extrinsics, intrinsics,
+    W_orig, H_orig, W_model, H_model,
+    pts3d_world, depth_valid,
+    pred_tracks_model, pred_vis,
+    vis_thresh=0.5,
+):
+    """
+    Write COLMAP sparse model using predicted track positions as 2D observations.
+
+    pred_tracks_model : (S, N, 2) float32 in model pixel coords
+    pred_vis          : (S, N)    float32 [0,1]
+    depth_valid       : (N,)      bool — which of the N query points have valid depth
+
+    Returns path to sparse/0/ dir, or None on error.
+    """
+    sparse_dir = os.path.join(out_dir, "sparse", "0")
+    os.makedirs(sparse_dir, exist_ok=True)
+
+    S = len(image_paths)
+    N = pred_tracks_model.shape[1]
+    sx = W_model / W_orig
+    sy = H_model / H_orig
+
+    # Write cameras.txt — one camera per image (per-frame intrinsics)
+    cameras_path = os.path.join(sparse_dir, "cameras.txt")
+    with open(cameras_path, "w") as fh:
+        fh.write("# Camera list\n#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        for i in range(S):
+            K = intrinsics[i]
+            fx = K[0, 0] / sx
+            fy = K[1, 1] / sy
+            cx = K[0, 2] / sx
+            cy = K[1, 2] / sy
+            fh.write(
+                f"{i+1} PINHOLE {W_orig} {H_orig} "
+                f"{fx:.6f} {fy:.6f} {cx:.6f} {cy:.6f}\n"
+            )
+
+    valid_pt_idx = np.where(depth_valid)[0]
+    # Remap: index into valid_pt_idx array -> COLMAP point3D id
+    pt3d_id_map = {int(ii): int(k + 1) for k, ii in enumerate(valid_pt_idx)}
+
+    # Write images.txt — predicted track positions as 2D observations
+    images_path = os.path.join(sparse_dir, "images.txt")
+    with open(images_path, "w") as fh:
+        fh.write(
+            "# Image list\n"
+            "#   IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n"
+            "#   POINTS2D[] as (X, Y, POINT3D_ID)\n"
+        )
+        for i, img_path in enumerate(image_paths):
+            img_name = os.path.basename(img_path)
+            R = extrinsics[i, :3, :3]
+            T = extrinsics[i, :3, 3]
+            qw, qx, qy, qz = _rot_to_colmap_quat(R)
+            fh.write(
+                f"{i+1} {qw:.9f} {qx:.9f} {qy:.9f} {qz:.9f} "
+                f"{T[0]:.9f} {T[1]:.9f} {T[2]:.9f} {i+1} {img_name}\n"
+            )
+            parts = []
+            for k, pt_idx in enumerate(valid_pt_idx):
+                vis_ij = float(pred_vis[i, pt_idx])
+                if vis_ij > vis_thresh:
+                    u_orig = float(pred_tracks_model[i, pt_idx, 0]) / sx
+                    v_orig = float(pred_tracks_model[i, pt_idx, 1]) / sy
+                    parts.append(f"{u_orig:.3f} {v_orig:.3f} {pt3d_id_map[int(pt_idx)]}")
+            fh.write(" ".join(parts) + "\n" if parts else "\n")
+
+    # Write points3D.txt — initial 3D points from depth unprojection
+    points_path = os.path.join(sparse_dir, "points3D.txt")
+    with open(points_path, "w") as fh:
+        fh.write(
+            "# 3D point list\n"
+            "#   POINT3D_ID X Y Z R G B ERROR TRACK[] as (IMAGE_ID, POINT2D_IDX)\n"
+        )
+        for k, pt_idx in enumerate(valid_pt_idx):
+            pt3d_id = pt3d_id_map[int(pt_idx)]
+            X, Y, Z = pts3d_world[pt_idx]
+            track_parts = []
+            for i in range(S):
+                if float(pred_vis[i, pt_idx]) > vis_thresh:
+                    track_parts.append(f"{i+1} {k}")
+            if track_parts:
+                fh.write(
+                    f"{pt3d_id} {X:.6f} {Y:.6f} {Z:.6f} "
+                    f"200 200 0 0.0 {' '.join(track_parts)}\n"
+                )
+
+    n_pts = len(valid_pt_idx)
+    print(f"    [ba-colmap] -> {sparse_dir} ({S} images, {n_pts} 3D pts)")
+    return sparse_dir
+
+
+def run_bundle_adjustment(sparse_in, work_dir, colmap_bin="colmap", max_iter=100):
+    """
+    Run COLMAP bundle_adjuster then convert output to text format.
+
+    Returns path to text-format sparse dir, or None on failure.
+    """
+    ba_bin_dir = os.path.join(work_dir, "ba_bin")
+    ba_txt_dir = os.path.join(work_dir, "ba_txt")
+    os.makedirs(ba_bin_dir, exist_ok=True)
+    os.makedirs(ba_txt_dir, exist_ok=True)
+
+    ba_cmd = [
+        colmap_bin, "bundle_adjuster",
+        "--input_path", sparse_in,
+        "--output_path", ba_bin_dir,
+        "--BundleAdjustment.max_num_iterations", str(max_iter),
+        "--BundleAdjustment.refine_focal_length", "1",
+        "--BundleAdjustment.refine_principal_point", "0",
+        "--BundleAdjustment.refine_extra_params", "0",
+    ]
+    r = subprocess.run(ba_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"    [BA] bundle_adjuster failed (code {r.returncode}):")
+        print(r.stderr[-400:])
+        return None
+
+    conv_cmd = [
+        colmap_bin, "model_converter",
+        "--input_path", ba_bin_dir,
+        "--output_path", ba_txt_dir,
+        "--output_type", "TXT",
+    ]
+    r2 = subprocess.run(conv_cmd, capture_output=True, text=True)
+    if r2.returncode != 0:
+        print(f"    [BA] model_converter failed (code {r2.returncode}):")
+        print(r2.stderr[-400:])
+        return None
+
+    print(f"    [BA] refined model -> {ba_txt_dir}")
+    return ba_txt_dir
+
+
+def read_colmap_refined_cameras(sparse_txt_dir, image_paths, W_model, H_model, W_orig, H_orig):
+    """
+    Parse COLMAP text cameras.txt + images.txt.
+
+    Returns:
+        extrinsics: (S, 3, 4) float32 at model resolution
+        intrinsics: (S, 3, 3) float32 at model resolution
+        or (None, None) on parse error.
+    """
+    try:
+        from scipy.spatial.transform import Rotation as ScipyRot
+    except ImportError:
+        print("    [BA] scipy not available — cannot parse refined cameras")
+        return None, None
+
+    sx = W_model / W_orig
+    sy = H_model / H_orig
+    S = len(image_paths)
+
+    # Parse cameras.txt
+    cam_params = {}  # cam_id -> (fx, fy, cx, cy) in original resolution
+    cameras_txt = os.path.join(sparse_txt_dir, "cameras.txt")
+    if not os.path.isfile(cameras_txt):
+        print(f"    [BA] cameras.txt not found in {sparse_txt_dir}")
+        return None, None
+    with open(cameras_txt) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            cam_id = int(parts[0])
+            # model = parts[1]  PINHOLE
+            # width/height in parts[2]/parts[3]
+            fx, fy, cx, cy = (
+                float(parts[4]), float(parts[5]),
+                float(parts[6]), float(parts[7]),
+            )
+            cam_params[cam_id] = (fx, fy, cx, cy)
+
+    # Parse images.txt (two lines per image: pose line + observation line)
+    images_txt = os.path.join(sparse_txt_dir, "images.txt")
+    if not os.path.isfile(images_txt):
+        print(f"    [BA] images.txt not found in {sparse_txt_dir}")
+        return None, None
+
+    img_name_to_pose = {}
+    with open(images_txt) as fh:
+        raw = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+    i = 0
+    while i < len(raw):
+        parts = raw[i].split()
+        if len(parts) < 10:
+            i += 1
+            continue
+        qw, qx, qy, qz = (
+            float(parts[1]), float(parts[2]),
+            float(parts[3]), float(parts[4]),
+        )
+        tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
+        cam_id = int(parts[8])
+        img_name = parts[9]
+        rot = ScipyRot.from_quat([qx, qy, qz, qw]).as_matrix()
+        img_name_to_pose[img_name] = (rot, np.array([tx, ty, tz], dtype=np.float32), cam_id)
+        i += 2  # skip observation line
+
+    if not img_name_to_pose:
+        print("    [BA] no poses parsed from images.txt")
+        return None, None
+
+    extrinsics = np.zeros((S, 3, 4), dtype=np.float32)
+    intrinsics = np.zeros((S, 3, 3), dtype=np.float32)
+
+    for idx, img_path in enumerate(image_paths):
+        img_name = os.path.basename(img_path)
+        if img_name not in img_name_to_pose:
+            print(f"    [BA] image {img_name} not found in refined model")
+            return None, None
+        rot, t, cam_id = img_name_to_pose[img_name]
+        extrinsics[idx, :3, :3] = rot
+        extrinsics[idx, :3, 3] = t
+        if cam_id not in cam_params:
+            print(f"    [BA] camera {cam_id} not found in refined model")
+            return None, None
+        fx, fy, cx, cy = cam_params[cam_id]
+        intrinsics[idx] = np.array([
+            [fx * sx, 0,       cx * sx],
+            [0,       fy * sy, cy * sy],
+            [0,       0,       1      ],
+        ], dtype=np.float32)
+
+    return extrinsics, intrinsics
+
+
+# ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
 
@@ -694,6 +982,7 @@ def eval_sequence_3d(
     seq_name, dataset_dir, models,
     track_num, device, dtype,
     colmap_dir=None,
+    run_ba=False, ba_colmap_dir=None, ba_colmap_bin="colmap", ba_max_iter=100,
     vis_n_tracks=50, vis_fps=8, vis_dir=None, split_name="val",
 ):
     """
@@ -775,6 +1064,77 @@ def eval_sequence_3d(
             f"  d5={metrics['delta_5px']:.3f}"
         )
 
+        # --- Bundle adjustment path ---
+        if run_ba and hasattr(model, "track_head") and model.track_head is not None:
+            try:
+                # Query frame-0 positions of the selected GT track points in model coords
+                sx_ba = W_model / W_orig
+                sy_ba = H_model / H_orig
+                q0 = gt_tracks_orig[0, valid_ids, :].copy()  # (N_use, 2) orig px
+                q0_model = q0 * np.array([[sx_ba, sy_ba]], dtype=np.float32)
+
+                print(f"  [{seq_name}][{tag}] running track head for BA ({len(valid_ids)} pts)...")
+                pred_tracks_model, pred_vis = _run_track_head_ba(
+                    model, images_tensor, q0_model, device, dtype
+                )
+
+                # Write COLMAP with predicted tracks as correspondences
+                ba_sparse_in = None
+                if ba_colmap_dir is not None:
+                    ba_write_dir = os.path.join(ba_colmap_dir, seq_name, tag)
+                    ba_sparse_in = write_colmap_from_pred_tracks(
+                        ba_write_dir, image_paths,
+                        extrinsics, intrinsics,
+                        W_orig, H_orig, W_model, H_model,
+                        pts3d_world, depth_valid,
+                        pred_tracks_model, pred_vis,
+                    )
+                else:
+                    import tempfile as _tf
+                    _ba_tmp = _tf.mkdtemp(prefix="vggt_ba_in_")
+                    ba_sparse_in = write_colmap_from_pred_tracks(
+                        _ba_tmp, image_paths,
+                        extrinsics, intrinsics,
+                        W_orig, H_orig, W_model, H_model,
+                        pts3d_world, depth_valid,
+                        pred_tracks_model, pred_vis,
+                    )
+                    # _ba_tmp cleaned up by the ba_work_tmp finally block below
+
+                if ba_sparse_in is not None:
+                    # BA work (binary + text output) goes to /tmp to avoid
+                    # GCS FUSE random-access write failures from COLMAP
+                    import tempfile as _tf2
+                    ba_work_tmp = _tf2.mkdtemp(prefix="vggt_ba_work_")
+                    try:
+                        ba_txt_dir = run_bundle_adjustment(
+                            ba_sparse_in, ba_work_tmp,
+                            colmap_bin=ba_colmap_bin, max_iter=ba_max_iter,
+                        )
+                        if ba_txt_dir is not None:
+                            ext_ba, int_ba = read_colmap_refined_cameras(
+                                ba_txt_dir, image_paths, W_model, H_model, W_orig, H_orig
+                            )
+                            if ext_ba is not None:
+                                ba_out = compute_reproj_metrics(
+                                    gt_tracks_orig, gt_vis_mask,
+                                    ext_ba, int_ba,
+                                    pred_depth, W_orig, H_orig, W_model, H_model,
+                                    track_num=track_num,
+                                )
+                                ba_metrics = ba_out[0]
+                                if ba_metrics is not None:
+                                    seq_results[f"{tag}_ba"] = ba_metrics
+                                    print(
+                                        f"  [{seq_name}][{tag}_ba]"
+                                        f"  reproj_ATE={ba_metrics['reproj_ate']:.2f}px"
+                                        f"  d5={ba_metrics['delta_5px']:.3f}"
+                                    )
+                    finally:
+                        shutil.rmtree(ba_work_tmp, ignore_errors=True)
+            except Exception as e:
+                print(f"  [{seq_name}][{tag}] BA failed: {e}")
+
     if vis_dir is not None and len(reproj_by_tag) > 0:
         visualize_sequence_reproj(
             seq_name, image_paths, gt_tracks_orig, gt_vis_mask,
@@ -812,6 +1172,7 @@ def mean_over_seqs(seq_results, tag):
 def eval_split(
     split_name, sequences, dataset_dir, models,
     track_num, device, dtype, colmap_dir=None,
+    run_ba=False, ba_colmap_dir=None, ba_colmap_bin="colmap", ba_max_iter=100,
     vis_max_seqs=3, vis_n_tracks=50, vis_fps=8, vis_dir=None,
 ):
     sep = "=" * 70
@@ -831,6 +1192,10 @@ def eval_split(
             seq_name, dataset_dir, models,
             track_num, device, dtype,
             colmap_dir=colmap_dir,
+            run_ba=run_ba,
+            ba_colmap_dir=ba_colmap_dir,
+            ba_colmap_bin=ba_colmap_bin,
+            ba_max_iter=ba_max_iter,
             vis_n_tracks=vis_n_tracks,
             vis_fps=vis_fps,
             vis_dir=vis_dir if do_viz else None,
@@ -840,7 +1205,16 @@ def eval_split(
         if r is not None and do_viz:
             viz_count += 1
 
-    tags = list(models.keys())
+    base_tags = list(models.keys())
+    # Include _ba variants if any sequence produced them
+    all_tags_seen = set()
+    for sr in seq_results.values():
+        if sr:
+            all_tags_seen.update(sr.keys())
+    tags = [t for t in base_tags if t in all_tags_seen]
+    tags += [t for t in sorted(all_tags_seen) if t not in base_tags]
+    if not tags:
+        tags = base_tags
     means = {tag: mean_over_seqs(seq_results, tag) for tag in tags}
 
     print(f"\n--- {split_name.upper()} MEAN METRICS ---")
@@ -887,7 +1261,8 @@ def main():
 
     print("\nLoading vanilla model ...")
     vanilla_model = load_model(
-        args.vanilla_ckpt, lora=False, device=device
+        args.vanilla_ckpt, lora=False, device=device,
+        enable_track=args.run_ba,
     )
     print("Loading fine-tuned model ...")
     finetuned_model = load_model(
@@ -897,8 +1272,12 @@ def main():
         lora_alpha=args.lora_alpha,
         lora_targets=args.lora_target_modules,
         device=device,
+        enable_track=args.run_ba,
     )
     models = {"vanilla": vanilla_model, "finetuned": finetuned_model}
+
+    if args.run_ba:
+        print("BA mode enabled: models loaded with track head (enable_track=True)")
 
     if args.vis_max_seqs != 0:
         label = "all" if args.vis_max_seqs < 0 else f"first {args.vis_max_seqs}"
@@ -918,6 +1297,13 @@ def main():
             os.path.join(args.colmap_dir, "val")
             if args.colmap_dir else None
         ),
+        run_ba=args.run_ba,
+        ba_colmap_dir=(
+            os.path.join(args.colmap_dir, "val_ba")
+            if args.colmap_dir and args.run_ba else None
+        ),
+        ba_colmap_bin=args.ba_colmap_bin,
+        ba_max_iter=args.ba_max_iter,
         vis_max_seqs=args.vis_max_seqs,
         vis_n_tracks=args.vis_n_tracks,
         vis_fps=args.vis_fps,
@@ -937,6 +1323,13 @@ def main():
                 os.path.join(args.colmap_dir, "train")
                 if args.colmap_dir else None
             ),
+            run_ba=args.run_ba,
+            ba_colmap_dir=(
+                os.path.join(args.colmap_dir, "train_ba")
+                if args.colmap_dir and args.run_ba else None
+            ),
+            ba_colmap_bin=args.ba_colmap_bin,
+            ba_max_iter=args.ba_max_iter,
             vis_max_seqs=args.vis_max_seqs,
             vis_n_tracks=args.vis_n_tracks,
             vis_fps=args.vis_fps,

@@ -1,24 +1,27 @@
-exp_name: rembrand_lora_r16_track_reproj_v1
-# EXP-09: Track + reproj only — clean run, NaN fixed.
+exp_name: rembrand_lora_r16_reproj_plane_homography_v1
+# EXP-09: EXP-06 base + homography consistency loss (Track A).
 #
-# What EXP-06/07/08 taught us:
-#   EXP-07 (track + depth_consistency): depth_consistency dead by ep10 (Pearson corr≈1
-#     on pretrained model → std→0 → NaN/inf in all pairwise tensors). Grad/depth=0.001,
-#     Grad/camera=0.000. Effectively trained on track loss alone. val=0.060 at ep72.
-#   EXP-08 (track + reproj + depth_consistency): depth_consistency dead by ep10 (same).
-#     NaN/inf in depth_consistency tensors propagated to backward graph BEFORE the
-#     zeros-guard ran → all Grad/* NaN from ep38 onward. Pod preempted at ep47,
-#     restarted from ep0 (no_resume=true). Run2 had same NaN from ep0.
-#     Best: run1 checkpoint_35.pt (val=0.058).
-#   EXP-06 (track + reproj + plane_rigidity): plane_rigidity neutral. LR=5e-5 caused
-#     reproj gradient variance oscillation (val 0.12↔0.45 every 5 epochs).
+# Base: EXP-06 (track + reproj + plane_rigidity, LR=5e-5)
+#   - Best 2D tracking so far: val/loss_track=0.0526 at ep90
+#   - Stable: no NaN, healthy Grad/* throughout
 #
-# EXP-09 is the distillation:
-#   - Drop depth_consistency: structurally dead + NaN source. Zero benefit.
-#   - Drop plane_rigidity: neutral, adds complexity without measurable gain.
-#   - Keep reproj at LR=2e-5: stable (no oscillation), effective (val=0.058 at ep35).
-#   - Fix find_unused_parameters=False: camera always gets grad via reproj,
-#     no unused params → eliminates clip_grad_norm_ NaN-on-None-grad bug.
+# New: L_homography — plane-at-infinity camera consistency
+#   H_0→t = K_t_orig @ R_rel @ K_0_orig^{-1}
+#   Apply H to frame-0 GT tracks (original resolution) → compare to frame-t GT tracks.
+#   No depth in the loop → gradient flows to camera head (R, K) only.
+#   Complements reproj (which supervises depth + t) and plane_rigidity (depth smoothness).
+#
+# Design choices:
+#   - Loss evaluated at original image resolution (K scaled from model → original res)
+#   - weight=0.1: same scale as reproj — conservative start
+#   - No translation in H (plane-at-infinity): valid for low-parallax regime
+#   - Mixed-plane tracks averaged out across N tracks per frame
+#
+# Expected signals:
+#   - Grad/camera should increase slightly (second supervision source for R, K)
+#   - Grad/depth unchanged (no depth in homography path)
+#   - val/loss_track ≤ EXP-06 (should not regress 2D tracking)
+#   - loss_homography decreasing from first epoch
 
 img_size: 518
 num_workers: 8
@@ -140,6 +143,8 @@ logging:
       keys_to_log:
         - objective
         - loss_reproj
+        - loss_plane_rigidity
+        - loss_homography
         - loss_track
         - loss_vis_track
         - loss_conf_track
@@ -147,13 +152,15 @@ logging:
       keys_to_log:
         - objective
         - loss_reproj
+        - loss_plane_rigidity
+        - loss_homography
         - loss_track
         - loss_vis_track
         - loss_conf_track
 
 
 checkpoint:
-  save_dir: /mnt/bucket/dawy/law_parallax_vggt_exp2/track_reproj/${exp_name}/ckpts
+  save_dir: /mnt/bucket/dawy/law_parallax_vggt_exp2/reproj_plane_homography/${exp_name}/ckpts
   save_freq: 5
   resume_checkpoint_path: null
   no_resume: true
@@ -163,21 +170,28 @@ checkpoint:
 loss:
   _target_: loss.MultitaskLoss
 
-  camera: null              # No COLMAP supervision
+  camera: null
 
-  depth: null               # Confidence exploit not solved
+  depth: null
 
   point: null
 
   track:
-    weight: 1.0             # 2D anchor — primary supervision signal
+    weight: 1.0
 
   reproj:
-    weight: 0.1             # Camera supervision via geometry
+    weight: 0.1
 
-  plane_rigidity: null      # Neutral in EXP-06 — dropped for simplicity
+  plane_rigidity:
+    weight: 0.3
+    consistency_weight: 1.0
+    plane_weight: 0.0
+    min_visible_frames: 2
 
-  depth_consistency: null   # Dead loss (Pearson corr≈1 on pretrained) + NaN source — removed
+  homography:
+    weight: 0.1             # Same scale as reproj — conservative start
+
+  depth_consistency: null
 
 
 optim:
@@ -185,7 +199,7 @@ optim:
 
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 2e-5
+    lr: 5e-5
     weight_decay: 0.05
 
   frozen_module_names: null
@@ -227,11 +241,11 @@ optim:
           schedulers:
             - _target_: fvcore.common.param_scheduler.LinearParamScheduler
               start_value: 1e-8
-              end_value: 2e-5
+              end_value: 5e-5
             - _target_: fvcore.common.param_scheduler.CosineParamScheduler
-              start_value: 2e-5
+              start_value: 5e-5
               end_value: 1e-8
-          lengths: [0.10, 0.90]     # 10 ep warmup — reproj needs time to stabilise
+          lengths: [0.05, 0.95]
           interval_scaling: ['rescaled', 'rescaled']
     weight_decay:
       - scheduler:
@@ -253,7 +267,7 @@ model:
 distributed:
   backend: nccl
   comms_dtype: None
-  find_unused_parameters: False  # reproj always provides camera grad — no unused params
+  find_unused_parameters: True
   timeout_mins: 30
   gradient_as_bucket_view: True
   bucket_cap_mb: 25
