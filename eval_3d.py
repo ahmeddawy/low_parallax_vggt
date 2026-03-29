@@ -1201,20 +1201,25 @@ def eval_split(
             and vis_max_seqs != 0
             and (vis_max_seqs < 0 or viz_count < vis_max_seqs)
         )
-        r, *_ = eval_sequence_3d(
-            seq_name, dataset_dir, models,
-            track_num, device, dtype,
-            colmap_dir=colmap_dir,
-            run_ba=run_ba,
-            ba_colmap_dir=ba_colmap_dir,
-            ba_colmap_bin=ba_colmap_bin,
-            ba_max_iter=ba_max_iter,
-            vis_n_tracks=vis_n_tracks,
-            vis_fps=vis_fps,
-            vis_dir=vis_dir if do_viz else None,
-            split_name=split_name,
-            max_frames=max_frames,
-        )
+        try:
+            r, *_ = eval_sequence_3d(
+                seq_name, dataset_dir, models,
+                track_num, device, dtype,
+                colmap_dir=colmap_dir,
+                run_ba=run_ba,
+                ba_colmap_dir=ba_colmap_dir,
+                ba_colmap_bin=ba_colmap_bin,
+                ba_max_iter=ba_max_iter,
+                vis_n_tracks=vis_n_tracks,
+                vis_fps=vis_fps,
+                vis_dir=vis_dir if do_viz else None,
+                split_name=split_name,
+                max_frames=max_frames,
+            )
+        except RuntimeError as exc:
+            print(f"  [{seq_name}] SKIP -- RuntimeError: {exc}")
+            import torch; torch.cuda.empty_cache()
+            r = None
 
         seq_results[seq_name] = r
         if r is not None and do_viz:
