@@ -113,6 +113,10 @@ def parse_args():
     p.add_argument("--vis-fps", type=int, default=8)
     p.add_argument("--vis-dir", default="reproj_eval_viz")
     p.add_argument("--output-json", default="reproj_eval_results.json")
+    p.add_argument(
+        "--max-frames", type=int, default=0,
+        help="Cap sequences to this many frames (evenly subsampled). 0 = no limit.",
+    )
     return p.parse_args()
 
 
@@ -984,6 +988,7 @@ def eval_sequence_3d(
     colmap_dir=None,
     run_ba=False, ba_colmap_dir=None, ba_colmap_bin="colmap", ba_max_iter=100,
     vis_n_tracks=50, vis_fps=8, vis_dir=None, split_name="val",
+    max_frames=0,
 ):
     """
     Run 3D reprojection eval for one sequence across all model tags.
@@ -1019,6 +1024,13 @@ def eval_sequence_3d(
     S = len(image_paths)
     gt_tracks_orig = gt_tracks_orig[:S]
     gt_vis_mask = gt_vis_mask[:S]
+
+    if max_frames > 0 and S > max_frames:
+        indices = np.linspace(0, S - 1, max_frames, dtype=int)
+        image_paths = [image_paths[i] for i in indices]
+        gt_tracks_orig = gt_tracks_orig[indices]
+        gt_vis_mask = gt_vis_mask[indices]
+        S = max_frames
 
     W_orig, H_orig, W_model, H_model = get_model_resolution(image_paths[0])
     images_tensor = load_and_preprocess_images(image_paths, mode="crop")
@@ -1174,6 +1186,7 @@ def eval_split(
     track_num, device, dtype, colmap_dir=None,
     run_ba=False, ba_colmap_dir=None, ba_colmap_bin="colmap", ba_max_iter=100,
     vis_max_seqs=3, vis_n_tracks=50, vis_fps=8, vis_dir=None,
+    max_frames=0,
 ):
     sep = "=" * 70
     print(f"\n{sep}")
@@ -1200,7 +1213,9 @@ def eval_split(
             vis_fps=vis_fps,
             vis_dir=vis_dir if do_viz else None,
             split_name=split_name,
+            max_frames=max_frames,
         )
+
         seq_results[seq_name] = r
         if r is not None and do_viz:
             viz_count += 1
@@ -1308,6 +1323,7 @@ def main():
         vis_n_tracks=args.vis_n_tracks,
         vis_fps=args.vis_fps,
         vis_dir=args.vis_dir,
+        max_frames=args.max_frames,
     )
 
     if args.train_split_file:
@@ -1334,6 +1350,7 @@ def main():
             vis_n_tracks=args.vis_n_tracks,
             vis_fps=args.vis_fps,
             vis_dir=args.vis_dir,
+            max_frames=args.max_frames,
         )
 
     def to_python(obj):
