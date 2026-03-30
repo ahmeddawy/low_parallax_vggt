@@ -791,8 +791,10 @@ def reproj_metrics_from_full_intrinsics(
 
 _GT_COLOR  = (0, 220, 0)
 _PANEL_DEFS = [
-    ("vanilla",   (220, 60,  60), "Vanilla"),
-    ("finetuned", (60,  130, 255), "Finetuned ROI"),
+    ("vanilla",      (220, 60,  60),  "Vanilla"),
+    ("finetuned",    (60,  130, 255), "Finetuned ROI"),
+    ("vanilla_ba",   (255, 150, 50),  "Vanilla+BA"),
+    ("finetuned_ba", (60,  210, 160), "Finetuned ROI+BA"),
 ]
 _SHIFT = 4
 _S16   = 1 << _SHIFT
@@ -810,6 +812,277 @@ def _encode_video(frames_dir, out_path, fps):
         print(f"    [viz] ffmpeg failed:\n{r.stderr[-400:]}")
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# AE plane metrics from 3D ROI predictions
+# ---------------------------------------------------------------------------
+
+def load_gt_corners(seq_dir):
+    csv_path = os.path.join(seq_dir, "ae_data", "corners.csv")
+    if not os.path.isfile(csv_path):
+        return None, None
+    data = np.loadtxt(csv_path, delimiter=",", skiprows=1, dtype=np.float64)
+    if data.ndim == 1:
+        data = data[np.newaxis]
+    frame_indices = data[:, 0].astype(np.int32)
+    corners = data[:, 1:].reshape(-1, 4, 2).astype(np.float32)
+    return frame_indices, corners
+
+
+def get_plane_point_ids(gt_tracks_orig, gt_vis_mask, ref_corners):
+    """Return indices of GT track points visible in frame 0 and inside plane bounding box."""
+    vis0  = gt_vis_mask[0]
+    pts0  = gt_tracks_orig[0]
+    x_min, y_min = ref_corners[:, 0].min(), ref_corners[:, 1].min()
+    x_max, y_max = ref_corners[:, 0].max(), ref_corners[:, 1].max()
+    inside = (
+        vis0
+        & (pts0[:, 0] >= x_min) & (pts0[:, 0] <= x_max)
+        & (pts0[:, 1] >= y_min) & (pts0[:, 1] <= y_max)
+    )
+    return np.where(inside)[0]
+
+
+def compute_plane_homographies_from_3d_roi(
+    pts0_orig, P_world,
+    extrinsics, intrinsics_roi,
+    roi, W_model, H_model, S,
+    ransac_thresh=3.0,
+):
+    """
+    For each frame j = 1..S-1:
+      Project P_world into ROI model space, convert back to original image coords,
+      RANSAC findHomography(pts0_orig → pts_j_orig).
+    Returns (S, 3, 3) homographies; H[0] = identity.
+    """
+    x1, y1, x2, y2 = roi
+    sx = W_model / (x2 - x1)
+    sy = H_model / (y2 - y1)
+
+    homographies = np.zeros((S, 3, 3), dtype=np.float32)
+    homographies[0] = np.eye(3, dtype=np.float32)
+
+    for j in range(1, S):
+        R_j = extrinsics[j, :3, :3]
+        T_j = extrinsics[j, :3, 3]
+        K_j = intrinsics_roi[j]
+
+        P_camj   = P_world @ R_j.T + T_j[None, :]
+        in_front = P_camj[:, 2] > 0.0
+
+        denom    = np.maximum(P_camj[:, 2], 1e-6)
+        u_j_roi  = P_camj[:, 0] / denom * K_j[0, 0] + K_j[0, 2]
+        v_j_roi  = P_camj[:, 1] / denom * K_j[1, 1] + K_j[1, 2]
+
+        # ROI model → original image
+        u_j_orig = u_j_roi / sx + x1
+        v_j_orig = v_j_roi / sy + y1
+        pts_j    = np.stack([u_j_orig, v_j_orig], axis=-1)
+
+        valid = in_front
+        if valid.sum() < 4:
+            homographies[j] = np.eye(3, dtype=np.float32)
+            continue
+
+        H, _ = cv2.findHomography(
+            pts0_orig[valid].reshape(-1, 1, 2).astype(np.float32),
+            pts_j[valid].reshape(-1, 1, 2).astype(np.float32),
+            cv2.RANSAC, ransac_thresh,
+        )
+        homographies[j] = H if H is not None else np.eye(3, dtype=np.float32)
+
+    return homographies
+
+
+def compute_corner_metrics(homographies, gt_frame_indices, gt_corners):
+    frame0_mask = gt_frame_indices == 0
+    if not frame0_mask.any():
+        return None
+    ref_corners = gt_corners[frame0_mask][0].astype(np.float64)
+    ref_h = np.concatenate([ref_corners, np.ones((4, 1), dtype=np.float64)], axis=1)
+    gt_lookup = {int(gt_frame_indices[i]): gt_corners[i] for i in range(len(gt_frame_indices))}
+
+    centroid_errors, corner_errors, pred_centroids = [], [], []
+    for t in range(len(homographies)):
+        if t not in gt_lookup:
+            continue
+        H    = homographies[t].astype(np.float64)
+        gt_c = gt_lookup[t].astype(np.float64)
+        proj = (H @ ref_h.T).T
+        proj /= proj[:, 2:3]
+        pred_c = proj[:, :2]
+        corner_errors.append(float(np.linalg.norm(pred_c - gt_c, axis=1).mean()))
+        pred_cen = pred_c.mean(axis=0)
+        centroid_errors.append(float(np.linalg.norm(pred_cen - gt_c.mean(axis=0))))
+        pred_centroids.append(pred_cen)
+
+    if not centroid_errors:
+        return None
+
+    pt  = np.array(centroid_errors)
+    ce  = np.array(corner_errors)
+    ctr = np.array(pred_centroids)
+    jitter = 0.0
+    if len(ctr) >= 4:
+        jerk   = np.diff(ctr, n=3, axis=0)
+        jitter = float(np.sqrt((jerk ** 2).sum(axis=1).mean()))
+
+    return {
+        "plane_pt_mean_px":       float(pt.mean()),
+        "plane_pt_median_px":     float(np.median(pt)),
+        "plane_pt_p95_px":        float(np.percentile(pt, 95)),
+        "plane_corner_mean_px":   float(ce.mean()),
+        "plane_corner_median_px": float(np.median(ce)),
+        "plane_corner_p95_px":    float(np.percentile(ce, 95)),
+        "plane_jitter_score":     jitter,
+    }
+
+
+def project_corners_through_homographies(ref_corners, homographies):
+    S     = len(homographies)
+    ref_h = np.concatenate(
+        [ref_corners.astype(np.float64), np.ones((4, 1), dtype=np.float64)], axis=1
+    )
+    pred = np.zeros((S, 4, 2), dtype=np.float32)
+    for t in range(S):
+        proj = (homographies[t].astype(np.float64) @ ref_h.T).T
+        proj /= proj[:, 2:3]
+        pred[t] = proj[:, :2].astype(np.float32)
+    return pred
+
+
+def _render_frame_planes(
+    image_path, fi, W_disp, H_disp,
+    gt_frame_lookup, pred_corners_by_tag,
+    single_tag=None, gt_only=False,
+):
+    arr = np.array(__import__("PIL").Image.open(image_path).convert("RGB"))
+    bg  = np.zeros((H_disp, W_disp, 3), dtype=np.uint8)
+    bg[:min(arr.shape[0], H_disp), :min(arr.shape[1], W_disp)] = arr[:H_disp, :W_disp]
+
+    _SHIFT = 4; _S16 = 1 << _SHIFT; _QUAD_ORDER = [0, 1, 3, 2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def _scale(c4x2):
+        return (c4x2.astype(np.float64)[_QUAD_ORDER] * _S16).astype(np.int32).reshape(-1, 1, 2)
+
+    if gt_only:
+        panel = bg.copy()
+        if gt_frame_lookup is not None and fi in gt_frame_lookup:
+            cv2.polylines(panel, [_scale(gt_frame_lookup[fi])],
+                          True, _GT_COLOR[::-1], 2, cv2.LINE_AA, _SHIFT)
+        cv2.putText(panel, "GT", (8, 22), font, 0.7, _GT_COLOR[::-1], 2, cv2.LINE_AA)
+        return panel
+
+    panel_defs = (
+        [(t, c, l) for t, c, l in _PANEL_DEFS if t == single_tag]
+        if single_tag is not None else _PANEL_DEFS
+    )
+    panels = []
+    for tag, color, label in panel_defs:
+        if tag not in pred_corners_by_tag:
+            continue
+        panel = bg.copy()
+        if gt_frame_lookup is not None and fi in gt_frame_lookup:
+            cv2.polylines(panel, [_scale(gt_frame_lookup[fi])],
+                          True, _GT_COLOR[::-1], 2, cv2.LINE_AA, _SHIFT)
+        cv2.polylines(panel, [_scale(pred_corners_by_tag[tag][fi])],
+                      True, color[::-1], 2, cv2.LINE_AA, _SHIFT)
+        cv2.putText(panel, label, (8, 22), font, 0.7, color[::-1], 2, cv2.LINE_AA)
+        panels.append(panel)
+
+    if not panels:
+        return np.zeros((H_disp, W_disp, 3), dtype=np.uint8)
+    divider = np.full((H_disp, 2, 3), 180, dtype=np.uint8)
+    frame = panels[0]
+    for p in panels[1:]:
+        frame = np.concatenate([frame, divider, p], axis=1)
+    return frame
+
+
+def visualize_planes(
+    seq_name, image_paths, W_orig, H_orig,
+    gt_frame_lookup, pred_corners_by_tag,
+    split_name, vis_dir, fps=8, seq_dir=None,
+):
+    """Save plane quad videos: planes_gt, planes_{tag}, planes_composed."""
+    import tempfile, shutil as _shutil
+
+    if not pred_corners_by_tag:
+        return
+    S = len(image_paths)
+    if S < 2:
+        return
+
+    if seq_dir is not None:
+        fps = get_sequence_fps(seq_dir, fallback=fps)
+
+    W_disp = W_orig + (W_orig % 2)
+    H_disp = H_orig + (H_orig % 2)
+    out_dir = os.path.join(vis_dir, split_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _save_video(render_kwargs, suffix):
+        out_path = os.path.join(out_dir, f"{seq_name}_{suffix}.mp4")
+        tmp_dir  = tempfile.mkdtemp(prefix="planes3d_roi_viz_")
+        try:
+            for fi in range(S):
+                frame_rgb = _render_frame_planes(
+                    image_paths[fi], fi, W_disp, H_disp,
+                    gt_frame_lookup, pred_corners_by_tag,
+                    **render_kwargs,
+                )
+                cv2.imwrite(os.path.join(tmp_dir, f"{fi:06d}.jpg"),
+                            frame_rgb[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if _encode_video(tmp_dir, out_path, fps):
+                print(f"    [viz planes] -> {out_path}  ({S} frames @ {fps:.1f}fps)")
+        finally:
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    _save_video({"gt_only": True}, "planes_gt")
+    for tag in [t for t, _, _ in _PANEL_DEFS if t in pred_corners_by_tag]:
+        _save_video({"single_tag": tag}, f"planes_{tag}")
+    _save_video({}, "planes_composed")
+
+
+def compute_plane_homographies_from_3d_full_intrinsics(
+    pts0_orig, P_world,
+    extrinsics, intrinsics_full,
+    S, ransac_thresh=3.0,
+):
+    """
+    BA variant: intrinsics_full is in full original image space.
+    Project P_world → original image coords directly (no ROI offset needed).
+    """
+    homographies = np.zeros((S, 3, 3), dtype=np.float32)
+    homographies[0] = np.eye(3, dtype=np.float32)
+
+    for j in range(1, S):
+        R_j = extrinsics[j, :3, :3]
+        T_j = extrinsics[j, :3, 3]
+        K_j = intrinsics_full[j]
+
+        P_camj   = P_world @ R_j.T + T_j[None, :]
+        in_front = P_camj[:, 2] > 0.0
+        denom    = np.maximum(P_camj[:, 2], 1e-6)
+        u_j      = P_camj[:, 0] / denom * K_j[0, 0] + K_j[0, 2]  # original image coords
+        v_j      = P_camj[:, 1] / denom * K_j[1, 1] + K_j[1, 2]
+        pts_j    = np.stack([u_j, v_j], axis=-1)
+
+        valid = in_front
+        if valid.sum() < 4:
+            homographies[j] = np.eye(3, dtype=np.float32)
+            continue
+
+        H, _ = cv2.findHomography(
+            pts0_orig[valid].reshape(-1, 1, 2).astype(np.float32),
+            pts_j[valid].reshape(-1, 1, 2).astype(np.float32),
+            cv2.RANSAC, ransac_thresh,
+        )
+        homographies[j] = H if H is not None else np.eye(3, dtype=np.float32)
+
+    return homographies
 
 
 def _render_frame_reproj(image_path, fi, gt_tracks_orig, gt_vis_mask,
@@ -939,6 +1212,12 @@ METRIC_KEYS = [
     "delta_1px", "delta_2px", "delta_5px", "delta_10px",
 ]
 
+PLANE_METRIC_KEYS = [
+    "plane_pt_mean_px", "plane_pt_median_px", "plane_pt_p95_px",
+    "plane_corner_mean_px", "plane_corner_median_px", "plane_corner_p95_px",
+    "plane_jitter_score",
+]
+
 
 def eval_sequence_3d_roi(
     seq_name, dataset_dir, models, roi_pad,
@@ -1004,6 +1283,29 @@ def eval_sequence_3d_roi(
         print(f"  [{seq_name}] SKIP -- ROI image load error: {exc}")
         return _skip
 
+    x1, y1, x2, y2 = roi
+    sx_roi = W_model / (x2 - x1)
+    sy_roi = H_model / (y2 - y1)
+
+    # Load GT corners once per sequence for plane AE metrics
+    gt_frame_indices, gt_corners = load_gt_corners(seq_dir)
+    gt_frame_lookup     = None
+    ref_corners         = None
+    plane_ids           = None
+    pred_corners_by_tag = {}
+
+    if gt_frame_indices is not None:
+        gt_frame_lookup = {
+            int(gt_frame_indices[i]): gt_corners[i]
+            for i in range(len(gt_frame_indices))
+        }
+        frame0_mask = gt_frame_indices == 0
+        if frame0_mask.any():
+            ref_corners = gt_corners[frame0_mask][0]
+            plane_ids   = get_plane_point_ids(gt_tracks_orig, gt_vis_mask, ref_corners)
+            if len(plane_ids) < 4:
+                plane_ids = None
+
     seq_results      = {}
     reproj_by_tag    = {}
     valid_ids_by_tag = {}
@@ -1047,6 +1349,42 @@ def eval_sequence_3d_roi(
             f"  reproj_ATE={metrics['reproj_ate']:.2f}px"
             f"  d5={metrics['delta_5px']:.3f}"
         )
+
+        # --- Plane AE metrics from 3D ROI ---
+        if plane_ids is not None:
+            pts0_orig = gt_tracks_orig[0, plane_ids, :]
+            K0 = intrinsics_roi[0]
+            R0 = extrinsics[0, :3, :3]
+            T0 = extrinsics[0, :3, 3]
+
+            u0_roi = (pts0_orig[:, 0] - x1) * sx_roi
+            v0_roi = (pts0_orig[:, 1] - y1) * sy_roi
+            u0i = np.floor(np.clip(u0_roi, 0, W_model - 1)).astype(int)
+            v0i = np.floor(np.clip(v0_roi, 0, H_model - 1)).astype(int)
+            d_val = pred_depth[0, v0i, u0i]
+
+            X0 = (u0_roi - K0[0, 2]) / K0[0, 0] * d_val
+            Y0 = (v0_roi - K0[1, 2]) / K0[1, 1] * d_val
+            P_cam0 = np.stack([X0, Y0, d_val], axis=-1)
+            P_world_plane = (P_cam0 - T0[None, :]) @ R0
+
+            homographies = compute_plane_homographies_from_3d_roi(
+                pts0_orig, P_world_plane,
+                extrinsics, intrinsics_roi,
+                roi, W_model, H_model, S,
+            )
+            plane_metrics = compute_corner_metrics(homographies, gt_frame_indices, gt_corners)
+            if plane_metrics is not None:
+                seq_results[tag].update(plane_metrics)
+                print(
+                    f"  [{seq_name}][{tag}]"
+                    f"  plane_pt={plane_metrics['plane_pt_mean_px']:.2f}px"
+                    f"  plane_corner={plane_metrics['plane_corner_mean_px']:.2f}px"
+                    f"  jitter={plane_metrics['plane_jitter_score']:.3f}"
+                )
+            pred_corners_by_tag[tag] = project_corners_through_homographies(
+                ref_corners, homographies
+            )
 
         # --- Bundle adjustment ---
         if run_ba and hasattr(model, "track_head") and model.track_head is not None:
@@ -1107,6 +1445,44 @@ def eval_sequence_3d_roi(
                                         f"  reproj_ATE={ba_metrics['reproj_ate']:.2f}px"
                                         f"  d5={ba_metrics['delta_5px']:.3f}"
                                     )
+
+                                    # Plane AE metrics using BA-refined cameras (full-image space)
+                                    if plane_ids is not None:
+                                        pts0_orig = gt_tracks_orig[0, plane_ids, :]
+                                        K0_full   = int_ba_full[0]
+                                        R0_ba     = ext_ba[0, :3, :3]
+                                        T0_ba     = ext_ba[0, :3, 3]
+
+                                        u0_roi = (pts0_orig[:, 0] - x1) * sx_roi
+                                        v0_roi = (pts0_orig[:, 1] - y1) * sy_roi
+                                        u0i = np.floor(np.clip(u0_roi, 0, W_model - 1)).astype(int)
+                                        v0i = np.floor(np.clip(v0_roi, 0, H_model - 1)).astype(int)
+                                        d_val_ba = pred_depth[0, v0i, u0i]
+
+                                        X0 = (pts0_orig[:, 0] - K0_full[0, 2]) / K0_full[0, 0] * d_val_ba
+                                        Y0 = (pts0_orig[:, 1] - K0_full[1, 2]) / K0_full[1, 1] * d_val_ba
+                                        P_cam0_ba = np.stack([X0, Y0, d_val_ba], axis=-1)
+                                        P_world_ba = (P_cam0_ba - T0_ba[None, :]) @ R0_ba
+
+                                        hom_ba = compute_plane_homographies_from_3d_full_intrinsics(
+                                            pts0_orig, P_world_ba,
+                                            ext_ba, int_ba_full, S,
+                                        )
+                                        pm_ba = compute_corner_metrics(
+                                            hom_ba, gt_frame_indices, gt_corners
+                                        )
+                                        if pm_ba is not None:
+                                            seq_results[f"{tag}_ba"].update(pm_ba)
+                                            print(
+                                                f"  [{seq_name}][{tag}_ba]"
+                                                f"  plane_pt={pm_ba['plane_pt_mean_px']:.2f}px"
+                                                f"  plane_corner={pm_ba['plane_corner_mean_px']:.2f}px"
+                                                f"  jitter={pm_ba['plane_jitter_score']:.3f}"
+                                            )
+                                        pred_corners_by_tag[f"{tag}_ba"] = \
+                                            project_corners_through_homographies(
+                                                ref_corners, hom_ba
+                                            )
                     finally:
                         shutil.rmtree(ba_work_tmp, ignore_errors=True)
             except Exception as e:
@@ -1121,6 +1497,13 @@ def eval_sequence_3d_roi(
             W_orig=W_orig, H_orig=H_orig, seq_dir=seq_dir,
         )
 
+    if vis_dir is not None and gt_frame_lookup is not None and pred_corners_by_tag:
+        visualize_planes(
+            seq_name, image_paths, W_orig, H_orig,
+            gt_frame_lookup, pred_corners_by_tag,
+            split_name, vis_dir, fps=vis_fps, seq_dir=seq_dir,
+        )
+
     return (
         seq_results if seq_results else None,
         image_paths, gt_tracks_orig, gt_vis_mask, reproj_by_tag,
@@ -1132,11 +1515,12 @@ def eval_sequence_3d_roi(
 # ---------------------------------------------------------------------------
 
 def mean_over_seqs(seq_results, tag):
-    vals = {k: [] for k in METRIC_KEYS}
+    all_keys = METRIC_KEYS + PLANE_METRIC_KEYS
+    vals = {k: [] for k in all_keys}
     for sr in seq_results.values():
         if sr is None or tag not in sr:
             continue
-        for k in METRIC_KEYS:
+        for k in all_keys:
             if k in sr[tag]:
                 vals[k].append(sr[tag][k])
     return {
@@ -1211,6 +1595,14 @@ def eval_split(
             f"  d5={m['delta_5px']:.3f}"
             f"  d10={m['delta_10px']:.3f}"
         )
+        if not np.isnan(m.get("plane_pt_mean_px", float("nan"))):
+            print(
+                f"  [{tag}] plane:"
+                f"  pt_mean={m['plane_pt_mean_px']:.3f}px"
+                f"  corner_mean={m['plane_corner_mean_px']:.3f}px"
+                f"  corner_p95={m['plane_corner_p95_px']:.3f}px"
+                f"  jitter={m['plane_jitter_score']:.3f}"
+            )
 
     return {"per_seq": seq_results, "mean": means}
 
