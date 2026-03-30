@@ -64,6 +64,7 @@ spec:
                 --vis-max-seqs    -1 \
                 --vis-n-tracks    50 \
                 --roi-pad         0.3 \
+                --max-frames      230 \
                 --ransac-thresh   3.0 \
                 --output-json     $OUT/shard_${IDX}.json \
                 --vis-dir         $OUT/viz \

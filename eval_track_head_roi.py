@@ -147,6 +147,10 @@ def parse_args():
             "Layout: <homography-dir>/<split>/<seq>/<tag>_H.npy  (S, 3, 3)"
         ),
     )
+    p.add_argument(
+        "--max-frames", type=int, default=0,
+        help="Cap sequences to this many frames (evenly subsampled). 0 = no limit.",
+    )
     return p.parse_args()
 
 
@@ -929,6 +933,7 @@ def eval_split(
     vis_max_seqs=3, vis_n_tracks=50, vis_fps=8, vis_dir="roi_eval_viz",
     ransac_thresh=3.0, min_h_inliers=8,
     homography_dir=None, ae_output_dir=None,
+    max_frames=0,
 ):
     results         = {tag: {} for tag in models}
     results.update({f"{tag}_h": {} for tag in models})
@@ -952,6 +957,14 @@ def eval_split(
         if load_err:
             print(f"    SKIP ({load_err})")
             continue
+
+        if max_frames > 0 and len(image_paths_seq) > max_frames:
+            S_orig = len(image_paths_seq)
+            indices = np.linspace(0, S_orig - 1, max_frames, dtype=int)
+            image_paths_seq = [image_paths_seq[i] for i in indices]
+            gt_tracks_seq   = gt_tracks_seq[indices]
+            gt_vis_seq      = gt_vis_seq[indices]
+            print(f"    subsampled {S_orig} -> {max_frames} frames")
 
         # Compute ROI once per sequence (shared across models)
         roi = load_roi_from_corners(seq_dir, roi_pad, W_orig_seq, H_orig_seq)
@@ -1212,6 +1225,7 @@ def main():
             min_h_inliers=args.min_h_inliers,
             homography_dir=args.homography_dir,
             ae_output_dir=args.ae_output_dir,
+            max_frames=args.max_frames,
         )
 
     sep = "=" * 70
