@@ -771,8 +771,10 @@ def read_colmap_refined_cameras(sparse_txt_dir, image_paths, W_model, H_model, W
 
 _GT_COLOR = (0, 220, 0)
 _PANEL_DEFS = [
-    ("vanilla",   (220, 60,  60),  "Vanilla"),
-    ("finetuned", (60,  130, 255), "Finetuned"),
+    ("vanilla",      (220, 60,  60),  "Vanilla"),
+    ("finetuned",    (60,  130, 255), "Finetuned"),
+    ("vanilla_ba",   (255, 150, 50),  "Vanilla+BA"),
+    ("finetuned_ba", (60,  210, 160), "Finetuned+BA"),
 ]
 
 _SHIFT = 4
@@ -1435,6 +1437,45 @@ def eval_sequence_3d(
                                         f"  reproj_ATE={ba_metrics['reproj_ate']:.2f}px"
                                         f"  d5={ba_metrics['delta_5px']:.3f}"
                                     )
+
+                                    # Plane AE metrics using BA-refined cameras
+                                    if plane_ids is not None:
+                                        pts0_orig = gt_tracks_orig[0, plane_ids, :]
+                                        K0_ba = int_ba[0]
+                                        R0_ba = ext_ba[0, :3, :3]
+                                        T0_ba = ext_ba[0, :3, 3]
+
+                                        u0 = pts0_orig[:, 0] * sx
+                                        v0 = pts0_orig[:, 1] * sy
+                                        u0i = np.floor(np.clip(u0, 0, W_model - 1)).astype(int)
+                                        v0i = np.floor(np.clip(v0, 0, H_model - 1)).astype(int)
+                                        d_val_ba = pred_depth[0, v0i, u0i]
+
+                                        X0 = (u0 - K0_ba[0, 2]) / K0_ba[0, 0] * d_val_ba
+                                        Y0 = (v0 - K0_ba[1, 2]) / K0_ba[1, 1] * d_val_ba
+                                        P_cam0_ba = np.stack([X0, Y0, d_val_ba], axis=-1)
+                                        P_world_ba = (P_cam0_ba - T0_ba[None, :]) @ R0_ba
+
+                                        hom_ba = compute_plane_homographies_from_3d(
+                                            pts0_orig, P_world_ba,
+                                            ext_ba, int_ba,
+                                            sx, sy, S,
+                                        )
+                                        pm_ba = compute_corner_metrics(
+                                            hom_ba, gt_frame_indices, gt_corners
+                                        )
+                                        if pm_ba is not None:
+                                            seq_results[f"{tag}_ba"].update(pm_ba)
+                                            print(
+                                                f"  [{seq_name}][{tag}_ba]"
+                                                f"  plane_pt={pm_ba['plane_pt_mean_px']:.2f}px"
+                                                f"  plane_corner={pm_ba['plane_corner_mean_px']:.2f}px"
+                                                f"  jitter={pm_ba['plane_jitter_score']:.3f}"
+                                            )
+                                        pred_corners_by_tag[f"{tag}_ba"] = \
+                                            project_corners_through_homographies(
+                                                ref_corners, hom_ba
+                                            )
                     finally:
                         shutil.rmtree(ba_work_tmp, ignore_errors=True)
             except Exception as e:
