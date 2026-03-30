@@ -824,6 +824,78 @@ def visualize_sequence(seq_name, image_paths, gt_tracks_orig, gt_vis_mask,
         _save_video({"single_tag": tag}, f"tracks_{tag}")
 
 
+def visualize_planes(
+    seq_name, image_paths, gt_tracks_orig, gt_vis_mask,
+    preds_by_tag, split_name, vis_dir, n_tracks, fps=8,
+    gt_frame_lookup=None, pred_corners_by_tag=None,
+    W_orig=None, H_orig=None, seq_dir=None,
+):
+    """
+    Save plane-quad comparison videos: GT + per-model + composed.
+    Skipped silently if no GT corners are available (corners.csv missing).
+    """
+    import tempfile, shutil
+
+    if gt_frame_lookup is None or pred_corners_by_tag is None:
+        return
+
+    S = len(image_paths)
+    if S < 2 or not preds_by_tag:
+        return
+
+    valid_ids = np.where(gt_vis_mask[1])[0]
+    if len(valid_ids) == 0:
+        return
+
+    rng = np.random.RandomState(42)
+    sampled_ids = rng.choice(valid_ids, size=min(n_tracks, len(valid_ids)), replace=False)
+
+    if W_orig is None or H_orig is None:
+        W_orig, H_orig, _, _ = get_model_resolution(image_paths[0])
+    W_disp = W_orig + (W_orig % 2)
+    H_disp = H_orig + (H_orig % 2)
+    sx = sy = 1.0
+
+    if seq_dir is not None:
+        fps = get_sequence_fps(seq_dir, fallback=fps)
+
+    out_dir = os.path.join(vis_dir, split_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _save_video(render_kwargs, suffix):
+        out_path = os.path.join(out_dir, f"{seq_name}_{suffix}.mp4")
+        tmp_dir = tempfile.mkdtemp(prefix="planes_viz_")
+        try:
+            for fi in range(S):
+                frame_rgb = _render_frame(
+                    image_paths[fi], fi,
+                    gt_tracks_orig, gt_vis_mask,
+                    preds_by_tag, sampled_ids,
+                    sx, sy, W_disp, H_disp,
+                    draw_tracks=False, draw_quads=True,
+                    gt_frame_lookup=gt_frame_lookup,
+                    pred_corners_by_tag=pred_corners_by_tag,
+                    **render_kwargs,
+                )
+                cv2.imwrite(os.path.join(tmp_dir, f"{fi:06d}.jpg"),
+                            frame_rgb[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if _encode_video(tmp_dir, out_path, fps):
+                print(f"    [viz planes] -> {out_path}  ({S} frames @ {fps:.1f}fps)")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # GT-only
+    _save_video({"gt_only": True}, "planes_gt")
+
+    # Per-model (base tags only)
+    base_tags = [tag for tag in preds_by_tag if not tag.endswith("_h")]
+    for tag in base_tags:
+        _save_video({"single_tag": tag}, f"planes_{tag}")
+
+    # Composed (all panels side by side)
+    _save_video({}, "planes_composed")
+
+
 # ---------------------------------------------------------------------------
 # Split-level evaluation
 # ---------------------------------------------------------------------------
@@ -992,6 +1064,15 @@ def eval_split(
                 gt_tracks_seq, gt_vis_seq,
                 preds_by_tag, split_name, vis_dir,
                 n_tracks=vis_n_tracks, fps=vis_fps,
+                W_orig=W_orig_seq, H_orig=H_orig_seq, seq_dir=seq_dir,
+            )
+            visualize_planes(
+                seq, image_paths_seq,
+                gt_tracks_seq, gt_vis_seq,
+                preds_by_tag, split_name, vis_dir,
+                n_tracks=vis_n_tracks, fps=vis_fps,
+                gt_frame_lookup=gt_frame_lookup,
+                pred_corners_by_tag=pred_corners_by_tag,
                 W_orig=W_orig_seq, H_orig=H_orig_seq, seq_dir=seq_dir,
             )
             viz_count += 1
